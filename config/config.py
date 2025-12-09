@@ -18,11 +18,15 @@ class Config(object):#配置类
 
         self.set_configuration()
 
+        # 显式声明关键属性，便于类型检查
+        self.exp_name: str = args.exp_name
+        self.proj_dir: str = args.proj_dir
+
         # set as attributes
         print("----Experiment Configuration-----")
-        for k, v in args.__dict__.items():
+        for k, v in args.__dict__.items():#实现将命令行参数打印出来
             print("{0:20}".format(k), v)
-            self.__setattr__(k, v)
+            self.__setattr__(k, v)#将命令行参数设置为配置类的属性
 
         # experiment paths
         self.exp_dir = os.path.join(self.proj_dir, self.exp_name)
@@ -55,17 +59,17 @@ class Config(object):#配置类
         self.n_layers = 4                # Number of Encoder blocks
         self.n_layers_decode = 4         # Number of Decoder blocks
         self.n_heads = 8                 # Transformer config: number of heads
-        self.dim_feedforward = 512      # Transformer config: FF dimensionality
-        self.d_model = 256               # Transformer config: model dimensionality
+        self.dim_feedforward = 512      # Transformer config: FF dimensionality，注意力机制中前馈神经网络的维度
+        self.d_model = 256               # Transformer config: model dimensionality，即嵌入向量的维度
         self.dropout = 0.1               # Dropout rate used in basic layers and Transformers
         self.dim_z = 256                 # Latent vector dimensionality
 
-        self.cad_max_n_ext = CAD_MAX_N_EXT
-        self.cad_max_n_loops = CAD_MAX_N_LOOPS
-        self.cad_max_n_curves = CAD_MAX_N_CURVES
+        self.cad_max_n_ext = CAD_MAX_N_EXT # cad最大挤出数
+        self.cad_max_n_loops = CAD_MAX_N_LOOPS # cad最大环数
+        self.cad_max_n_curves = CAD_MAX_N_CURVES # cad最大曲线数
 
-        self.cad_max_total_len = CAD_MAX_TOTAL_LEN
-        self.svg_max_total_len = SVG_MAX_TOTAL_LEN
+        self.cad_max_total_len = CAD_MAX_TOTAL_LEN # cad最大序列长度
+        self.svg_max_total_len = SVG_MAX_TOTAL_LEN # svg最大序列长度
 
         self.loss_weights = {
             "loss_cmd_weight": 1.0,

@@ -4,11 +4,11 @@ import torch.nn.functional as F
 from config.macro import CAD_EOS_IDX, CAD_SOL_IDX, CAD_EXT_IDX, SVG_EOS_IDX
 
 
-def _make_seq_first(*args):
+def _make_seq_first(*args):#将输入的张量的第一个维度和第二个维度交换位置
     # N, S, ... -> S, N, ...
     if len(args) == 1:
         arg, = args
-        return arg.permute(1, 0, *range(2, arg.dim())) if arg is not None else None
+        return arg.permute(1, 0, *range(2, arg.dim())) if arg is not None else None 
     return (*(arg.permute(1, 0, *range(2, arg.dim())) if arg is not None else None for arg in args),)
 
 

@@ -9,9 +9,9 @@ CAD_SOL_IDX = CAD_COMMANDS.index('SOL')
 CAD_EXT_IDX = CAD_COMMANDS.index('Ext')
 
 CAD_EXTRUDE_OPERATIONS = ["NewBodyFeatureOperation", "JoinFeatureOperation",
-                      "CutFeatureOperation", "IntersectFeatureOperation"]
+                      "CutFeatureOperation", "IntersectFeatureOperation"]#挤出操作类型
 CAD_EXTENT_TYPE = ["OneSideFeatureExtentType", "SymmetricFeatureExtentType",
-               "TwoSidesFeatureExtentType"]
+               "TwoSidesFeatureExtentType"]#挤出范围类型
 
 SVG_COMMANDS = ['SOS', 'EOS', 'L', 'C']
 SVG_SOS_IDX = SVG_COMMANDS.index('SOS')
@@ -36,7 +36,7 @@ CAD_EOS_VEC = np.array([CAD_EOS_IDX, *([PAD_VAL] * CAD_N_ARGS)])
 
 SVG_SOS_VEC = np.array([SVG_SOS_IDX, *([PAD_VAL] * SVG_N_ARGS)])
 SVG_EOS_VEC = np.array([SVG_EOS_IDX, *([PAD_VAL] * SVG_N_ARGS)])
-
+#cad命令参数掩码，作用是标识每个命令对应的参数位置，1表示该位置有参数，0表示无参数
 CAD_CMD_ARGS_MASK = np.array([[1, 1, 0, 0, 0, *[0]*CAD_N_ARGS_EXT],  # line
                           [1, 1, 1, 1, 0, *[0]*CAD_N_ARGS_EXT],  # arc
                           [1, 1, 0, 0, 1, *[0]*CAD_N_ARGS_EXT],  # circle
@@ -57,4 +57,4 @@ CAD_MAX_N_CURVES = 15 # maximum number of curves per loop
 
 CAD_MAX_TOTAL_LEN = 60 # maximum cad sequence length
 SVG_MAX_TOTAL_LEN = 100 # maximum svg sequence length
-ARGS_DIM = 256
+ARGS_DIM = 256 # dimensionality of argument vectors，命令参数维度

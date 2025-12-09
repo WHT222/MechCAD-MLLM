@@ -21,7 +21,7 @@ class PositionalEncodingSinCos(nn.Module):
         return self.dropout(x)
 
 
-class PositionalEncodingLUT(nn.Module):
+class PositionalEncodingLUT(nn.Module):# 位置编码：学习型查找表形式
 
     def __init__(self, d_model, dropout=0.1, max_len=250):
         super(PositionalEncodingLUT, self).__init__()

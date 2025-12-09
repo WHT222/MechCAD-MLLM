@@ -5,52 +5,6 @@ from .model_utils import _make_seq_first, _make_batch_first, \
     _get_padding_mask_svg, _get_key_padding_mask_svg
 
 
-class SVGEmbedding(nn.Module):#处理SVG输入的embedding
-    """Embedding: view embed + command embed + parameter embed + positional embed
-    嵌入方式：视图嵌入+命令嵌入+参数嵌入+位置嵌入
-    1x: 命令嵌入 + 参数嵌入 + 位置嵌入
-    3x or 4x: 视图嵌入 + 命令嵌入 + 参数嵌入 + 位置嵌入
-    """
-    def __init__(self, cfg, seq_len):
-        super().__init__()
-
-        """concatenation-based"""
-        # 3x or 4x
-        if cfg.input_option == "3x" or cfg.input_option == "4x":#处理3倍或4倍输入选项
-            self.view_embed = nn.Embedding(4, 4)#视图嵌入维度为4
-            self.command_embed = nn.Embedding(cfg.svg_n_commands, 8)#命令嵌入维度为8
-        # 1x: keep dimension constant with other input option#1x：保持与其他输入选项的维度恒定
-        if cfg.input_option == "1x":
-            self.command_embed = nn.Embedding(cfg.svg_n_commands, 12)
-
-        args_dim = cfg.args_dim + 1
-        self.args_embed = nn.Embedding(args_dim, 64, padding_idx=0)
-        self.args_mlp = nn.Linear(64 * cfg.svg_n_args, 128)
-        self.mlp = nn.Linear(4 + 8 + 128, cfg.d_model)
-        self.pos_encoding = PositionalEncodingLUT(cfg.d_model, max_len=seq_len + 2)
-        
-    
-    def forward(self, view, command, args):
-        assert command.shape == view.shape
-        S, N = command.shape
-
-        command_embedding = self.command_embed(command.long())
-        args_embedding = self.args_mlp(self.args_embed((args + 1).long()).view(S, N, -1))
-
-        """concatenation-based"""
-        # 1x
-        if S == 100:
-            src = torch.cat([command_embedding, args_embedding], dim=-1)
-        # 3x or 4x
-        if S > 100:
-            view_embedding = self.view_embed(view.long())
-            src = torch.cat([view_embedding, command_embedding, args_embedding], dim=-1)
-        
-        src = self.mlp(src)
-        src = self.pos_encoding(src)
-
-        return src
-    
 class ConstEmbedding(nn.Module):
     """
     learned constant embedding
@@ -60,7 +14,7 @@ class ConstEmbedding(nn.Module):
         super().__init__()
 
         self.d_model = cfg.d_model
-        self.PE = PositionalEncodingLUT(cfg.d_model, max_len=cfg.cad_max_total_len)
+        self.PE = PositionalEncodingLUT(cfg.d_model, max_len=cfg.cad_max_total_len)#这是位置编码器
         self.seq_len = cfg.cad_max_total_len
 
     def forward(self, z):
@@ -68,28 +22,6 @@ class ConstEmbedding(nn.Module):
         src = self.PE(z.new_zeros(self.seq_len, N, self.d_model))
         return src
 
-class Encoder(nn.Module):
-    def __init__(self, cfg):
-        super().__init__()
-
-        view_num = int(cfg.input_option[0])
-        seq_len = view_num * cfg.svg_max_total_len
-        self.embedding = SVGEmbedding(cfg, seq_len)
-
-        encoder_layer = TransformerEncoderLayerImproved(cfg.d_model, cfg.n_heads, cfg.dim_feedforward, cfg.dropout)
-        encoder_norm = LayerNorm(cfg.d_model)
-        self.encoder = TransformerEncoder(encoder_layer, cfg.n_layers, encoder_norm)
-    
-    def forward(self, view, command, args):
-        assert command.shape == view.shape
-        padding_mask, key_padding_mask = _get_padding_mask_svg(command, seq_dim=0), _get_key_padding_mask_svg(command, seq_dim=0)
-    
-        src = self.embedding(view, command, args)
-
-        memory = self.encoder(src, mask=None, src_key_padding_mask=key_padding_mask)
-
-        z = (memory * padding_mask).sum(dim=0, keepdim=True) / padding_mask.sum(dim=0, keepdim=True) # (1, N, dim_z)
-        return z
 
 class CommandFCN(nn.Module):
     def __init__(self, d_model, n_commands):
@@ -129,7 +61,7 @@ class ArgsFCN(nn.Module):
 
         return args_logits
 
-class CommandDecoder(nn.Module):#命令嵌入，继承nn.Module（这是用于定义神经网络模块的基类）
+class CommandDecoder(nn.Module):
     def __init__(self, cfg):
         super(CommandDecoder, self).__init__()
 
@@ -174,45 +106,54 @@ class ArgsDecoder(nn.Module):
 
         return args_logits
 
-class Bottleneck(nn.Module):
-    def __init__(self, cfg):
-        super(Bottleneck, self).__init__()
 
-        self.bottleneck = nn.Sequential(nn.Linear(cfg.d_model, cfg.d_model // 2),
-                                        nn.GELU(),
-                                        nn.Linear(cfg.d_model // 2, cfg.d_model))
+    
+# 进行修改，借用双解码器结构
+class LLM2CADDecoder(nn.Module):
+    def __init__(self, cfg, llm_hidden_dim=4096):
+        """
+        cfg: 沿用 Drawing2CAD 的配置对象
+        llm_hidden_dim: 使用的 LLM 的输出维度 (例如 LLaMA-2-7B 是 4096)，可修改以适配不同的模型
+        该解码器模块将 LLM 的输出特征转换为 CAD 命令和参数
+        1. 通过线性层将 LLM 的高维特征适配到 CAD 解码器的维度
+        2. 使用 Drawing2CAD 的双解码器结构，先预测命令，再预测参数
+        """
+        super().__init__()
+        self.d_model = cfg.d_model # Drawing2CAD 默认是 256
 
-    def forward(self, z):
-        return z + self.bottleneck(z)
-
-class SVG2CADTransformer(nn.Module):
-    def __init__(self, cfg):
-        super(SVG2CADTransformer, self).__init__()
-
-        self.args_dim = cfg.args_dim + 1
-
-        self.encoder = Encoder(cfg)
-
-        self.bottleneck = Bottleneck(cfg)
-
+        # 1. 适配层：将 LLM 的高维特征压缩到 CAD 解码器的维度
+        self.adapter = nn.Linear(llm_hidden_dim, self.d_model)
+        
+        # 2. 复用 Drawing2CAD 的双解码器结构
         self.command_decoder = CommandDecoder(cfg)
         self.args_decoder = ArgsDecoder(cfg)
 
-    def forward(self, views_enc, commands_enc, args_enc):
-        views_enc_, commands_enc_, args_enc_ = _make_seq_first(views_enc, commands_enc, args_enc)  # Possibly None, None, None
-
-        z = self.encoder(views_enc_, commands_enc_, args_enc_)
-        z = self.bottleneck(z)
+    def forward(self, llm_features):
+        """
+        llm_features: [Batch_Size, LLM_Seq_Len, LLM_Hidden_Dim] 
+                      这是 MLLM (如 LLaVA) 输出的语义向量
+        """
+        # 步骤 A: 维度适配
+        # z 的形状变为 [Batch_Size, LLM_Seq_Len, 256]
+        z = self.adapter(llm_features)
         
-        """command-guided generation"""
+        # 步骤 B: 聚合特征 (Pooling)
+        # Drawing2CAD 的解码器期望 z 是全局特征。
+        # 这里我们简单地取平均，或者取第一个 token (CLS) 的特征。后续改进为注意力池化等更复杂的方式也可以。
+        # z 形状变为 [1, Batch_Size, 256] 以适配 Transformer Decoder 的输入要求 (Seq_Len, Batch, Dim)
+        z = torch.mean(z, dim=1, keepdim=True).permute(1, 0, 2) #(Batch, 1, Dim) -> (1, Batch, Dim)
+
+        # 步骤 C: 双解码生成
+        # 1. 先预测命令，并输出 guidance (指导信号)
+        # command_logits: [Seq_Len, Batch, n_commands]
+        # guidance: [Seq_Len, Batch, d_model] -> 包含了解码器对“当前是什么命令”的理解
         command_logits, guidance = self.command_decoder(z)
-        command_logits = _make_batch_first(command_logits)
+
+        # 2. 再预测参数，将 guidance 加进去
         args_logits = self.args_decoder(z, guidance)
-        args_logits = _make_batch_first(args_logits)
 
-        res = {
-            "command_logits": command_logits,
-            "args_logits": args_logits
-        }
+        # 调整输出维度为 [Batch, Seq_Len, ...] 以便计算 Loss
+        command_logits = command_logits.permute(1, 0, 2)# [N, S, n_commands]
+        args_logits = args_logits.permute(1, 0, 2, 3)# [N, S, n_args, args_dim]
 
-        return res
+        return command_logits, args_logits
