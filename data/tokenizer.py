@@ -1,8 +1,16 @@
 import numpy as np
 import torch
+import sys
+import os
+
+# 设置工作目录为项目根目录
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+os.chdir(project_root)               
 
 class CADtokenizer:
     def __init__(self, cfg):
+        self.cfg = cfg
+        
         # --- 1. 命令词表 ---
         # 对应 DeepCAD/Drawing2CAD 的命令类型
         self.cmd_vocab = {
@@ -12,25 +20,23 @@ class CADtokenizer:
         self.id2cmd = {v: k for k, v in self.cmd_vocab.items()}#反转字典
         self.n_commands = len(self.cmd_vocab)# 命令词表大小， 7 个命令
 
-        # --- 2. 基础参数配置 ---
-        self.n_bins = 256  # 2D坐标量化精度 (Drawing2CAD默认)
-        self.min_val = -1.0 # 坐标最小值
-        self.max_val = 1.0 # 坐标最大值
+        # --- 2. 从 cfg 读取基础几何参数 ---
+        self.n_bins = cfg.n_bins
+        self.min_val = cfg.min_val
+        self.max_val = cfg.max_val
         
-        # --- 3. 空间Token配置 (CAD-GPT Innovation) ---
-        # 角度离散化: 3个欧拉角，每个角分 9 档 -> 729 个Token
-        self.angle_bins = 9 
-        self.n_angle_tokens = self.angle_bins ** 3 
+        # --- 3. 从 cfg 读取空间Token配置 ---
+        self.angle_bins = cfg.angle_bins
+        self.pos_grid_size = cfg.pos_grid_size
         
-        # 3D位置离散化: K=36 -> 46656 个Token
-        self.pos_grid_size = 36 
-        self.n_pos_tokens = self.pos_grid_size ** 3
+        self.n_angle_tokens = cfg.n_angle_tokens
+        self.n_pos_tokens = cfg.n_pos_tokens
 
     # ================= 核心功能：数值 -> Token ID =================
     
     def quantize_val(self, val):
         """将 [-1, 1] 的浮点数映射到 [0, 255]"""
-        val = np.clip(val, self.min_val, self.max_val)
+        val = np.clip(val, self.min_val, self.max_val)#裁剪到范围内
         norm = (val - self.min_val) / (self.max_val - self.min_val)
         return int(norm * (self.n_bins - 1))
 
@@ -82,10 +88,11 @@ class CADtokenizer:
 
 # 测试代码
 if __name__ == "__main__":
-    tok = CADtokenizer(None)
+    cfg = Config("train")
+    tok = CADtokenizer(cfg)
     print(f"命令词表大小: {tok.n_commands}")
     print(f"角度Token数量: {tok.n_angle_tokens}") # 应为 729
-    print(f"位置Token数量: {tok.n_pos_tokens}")   # 应为 32768
+    print(f"位置Token数量: {tok.n_pos_tokens}")   # 应为 46656
     
     # 测试编码
     angle_token = tok.encode_angle(0.5, 0.5, 0.5)

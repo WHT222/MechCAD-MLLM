@@ -28,7 +28,7 @@ class Config(object):#配置类
             print("{0:20}".format(k), v)
             self.__setattr__(k, v)#将命令行参数设置为配置类的属性
 
-        # experiment paths
+        # 路径处理逻辑
         self.exp_dir = os.path.join(self.proj_dir, self.exp_name)
         if phase == "train" and args.cont is not True and os.path.exists(self.exp_dir):
             response = input('Experiment log/model already exists, overwrite? (y/n) ')
@@ -76,6 +76,27 @@ class Config(object):#配置类
             "loss_args_weight": 2.0
         }
 
+        # --- [新增] 适配 LLM 的参数 ---
+        self.llm_hidden_dim = 4096  # LLaVA-7B/Vicuna-7B 的输出维度
+        
+        # --- [新增] 适配 CAD-GPT 空间机制的参数 ---
+        # 2D Sketch 参数量化 
+        self.n_bins = 256 
+        self.min_val = -1.0
+        self.max_val = 1.0
+        
+        # 3D Extrude 空间/角度 Token (CAD-GPT 相关)
+        self.angle_bins = 9         # 欧拉角离散化粒度 (9档)
+        self.pos_grid_size = 36     # 3D空间体素化粒度 (36x36x36)
+        
+    # 计算衍生参数 (方便调用)
+    @property
+    def n_angle_tokens(self):
+        return self.angle_bins ** 3
+            
+    @property
+    def n_pos_tokens(self):
+        return self.pos_grid_size ** 3
         
     def parse(self):
         """
