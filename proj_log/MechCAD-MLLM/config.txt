@@ -1,0 +1,20 @@
+{
+  "proj_dir": "proj_log",
+  "data_root": "data",
+  "exp_name": "MechCAD-MLLM",
+  "gpu_ids": "0",
+  "batch_size": 256,
+  "num_workers": 8,
+  "nr_epochs": 200,
+  "lr": 0.001,
+  "grad_clip": 1.0,
+  "warmup_step": 2000,
+  "cont": false,
+  "ckpt": "latest",
+  "vis": false,
+  "save_frequency": 100,
+  "val_frequency": 50,
+  "vis_frequency": 2000,
+  "input_option": "3x",
+  "pos_grid_size": 36
+}

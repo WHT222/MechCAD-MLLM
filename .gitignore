@@ -1,0 +1,6 @@
+# .gitignore 内容示例
+data/
+dataset/
+*.csv
+*.pth
+__pycache__/

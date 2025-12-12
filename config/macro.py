@@ -21,11 +21,11 @@ SVG_C_IDX = SVG_COMMANDS.index('C')
 
 PAD_VAL = -1
 CAD_N_ARGS_SKETCH = 5 # sketch parameters: x, y, alpha, f, r
-CAD_N_ARGS_PLANE = 3 # sketch plane orientation: theta, phi, gamma
-CAD_N_ARGS_TRANS = 4 # sketch plane origin + sketch bbox size: p_x, p_y, p_z, s
+CAD_N_ARGS_PLANE = 1 # sketch plane orientation: theta, phi, gamma -> single angle token
+CAD_N_ARGS_TRANS = 2 # sketch plane origin + sketch bbox size: p_xyz_token, s
 CAD_N_ARGS_EXT_PARAM = 4 # extrusion parameters: e1, e2, b, u
-CAD_N_ARGS_EXT = CAD_N_ARGS_PLANE + CAD_N_ARGS_TRANS + CAD_N_ARGS_EXT_PARAM
-CAD_N_ARGS = CAD_N_ARGS_SKETCH + CAD_N_ARGS_EXT
+CAD_N_ARGS_EXT = CAD_N_ARGS_PLANE + CAD_N_ARGS_TRANS + CAD_N_ARGS_EXT_PARAM # 1 + 2 + 4 = 7
+CAD_N_ARGS = CAD_N_ARGS_SKETCH + CAD_N_ARGS_EXT # 5 + 7 = 12
 
 SVG_N_ARGS_LINE = 4 # start=(x1, y1), end=(x2, y2)
 SVG_N_ARGS_BEZIERCURVE = 8 # start=(x1, y1), control1=(cx1,cy1), control2=(cx2,cy2), end=(x2, y2)

@@ -8,7 +8,7 @@ from .model_utils import _make_seq_first, _make_batch_first, \
 class ConstEmbedding(nn.Module):
     """
     learned constant embedding
-    学习常数嵌入
+    学习常数嵌入,
     """
     def __init__(self, cfg):
         super().__init__()
@@ -92,8 +92,24 @@ class ArgsDecoder(nn.Module):
         decoder_norm = LayerNorm(cfg.d_model)
         self.decoder = TransformerDecoder(decoder_layer, cfg.n_layers_decode, decoder_norm)
 
-        args_dim = cfg.args_dim + 1
-        self.fcn = ArgsFCN(cfg.d_model, cfg.cad_n_args, args_dim)
+        # 基础全连接网络，输出尺寸为 args_dim + 1
+        args_dim_features = cfg.args_dim + 1 
+        self.fcn = ArgsFCN(cfg.d_model, cfg.cad_n_args, args_dim_features)
+
+        # 独立的头部用于离散角度和位置Token
+        self.cad_n_args = cfg.cad_n_args
+        self.n_angle_tokens = cfg.n_angle_tokens
+        self.n_pos_tokens = cfg.n_pos_tokens
+
+        # These indices refer to the argument slots for angle and position tokens #
+        # CAD_N_ARGS_SKETCH is 5, so angle_token is at index 5, pos_token at index 6
+        from config.macro import CAD_N_ARGS_SKETCH
+        self.angle_token_idx = CAD_N_ARGS_SKETCH + 0
+        self.pos_token_idx = CAD_N_ARGS_SKETCH + 1
+
+        self.angle_head = nn.Linear(args_dim_features, self.n_angle_tokens)
+        self.pos_head = nn.Linear(args_dim_features, self.n_pos_tokens)
+
 
     def forward(self, z, guidance):
         src = self.embedding(z)
@@ -102,9 +118,16 @@ class ArgsDecoder(nn.Module):
         # guidance
         out = out + guidance
 
-        args_logits = self.fcn(out)
+        # args_features: [S, N, cad_n_args, args_dim_features]
+        args_features = self.fcn(out)
 
-        return args_logits
+        # Extract features for discrete tokens and pass through their heads，额外的两个头部分别预测角度Token和位置Token
+        angle_token_logits = self.angle_head(args_features[:, :, self.angle_token_idx, :])
+        pos_token_logits = self.pos_head(args_features[:, :, self.pos_token_idx, :])
+
+        # Return all as a tuple. The original args_features can be used for continuous args，
+        # The calling LLM2CADDecoder will need to correctly interpret these.
+        return args_features, angle_token_logits, pos_token_logits
 
 
     
@@ -150,10 +173,12 @@ class LLM2CADDecoder(nn.Module):
         command_logits, guidance = self.command_decoder(z)
 
         # 2. 再预测参数，将 guidance 加进去
-        args_logits = self.args_decoder(z, guidance)
+        args_features_for_continuous, angle_token_logits, pos_token_logits = self.args_decoder(z, guidance)
 
         # 调整输出维度为 [Batch, Seq_Len, ...] 以便计算 Loss
         command_logits = command_logits.permute(1, 0, 2)# [N, S, n_commands]
-        args_logits = args_logits.permute(1, 0, 2, 3)# [N, S, n_args, args_dim]
+        args_features_for_continuous = args_features_for_continuous.permute(1, 0, 2, 3)# [N, S, n_args, args_dim]
+        angle_token_logits = angle_token_logits.permute(1, 0, 2) # [N, S, n_angle_tokens]
+        pos_token_logits = pos_token_logits.permute(1, 0, 2) # [N, S, n_pos_tokens]
 
-        return command_logits, args_logits
+        return command_logits, args_features_for_continuous, angle_token_logits, pos_token_logits
