@@ -62,7 +62,7 @@ class Config(object):#配置类
         self.dim_feedforward = 512      # Transformer config: FF dimensionality，注意力机制中前馈神经网络的维度
         self.d_model = 256               # Transformer config: model dimensionality，即嵌入向量的维度
         self.dropout = 0.1               # Dropout rate used in basic layers and Transformers
-        self.dim_z = 256                 # Latent vector dimensionality
+        self.dim_z = 256                 # Latent vector dimensionality，即潜在向量的维度
 
         self.cad_max_n_ext = CAD_MAX_N_EXT # cad最大挤出数
         self.cad_max_n_loops = CAD_MAX_N_LOOPS # cad最大环数
@@ -82,8 +82,10 @@ class Config(object):#配置类
         # --- [新增] 适配 CAD-GPT 空间机制的参数 ---
         # 2D Sketch 参数量化 
         self.n_bins = 256 
+        self.sketch_bins = 128  # 2D草图坐标单坐标轴量化等级
         self.min_val = -1.0
         self.max_val = 1.0
+        "n_bins与n_sketch_bins的区别在于，n_bins是通用参数量化等级，n_sketch_bins专门用于2D草图坐标的量化,实则没有必要区分，可以统一为256"
         
         # 3D Extrude 空间/角度 Token (CAD-GPT 相关)
         self.angle_bins = 9         # 欧拉角离散化粒度 (9档)
@@ -97,6 +99,10 @@ class Config(object):#配置类
     @property
     def n_pos_tokens(self):
         return self.pos_grid_size ** 3
+    
+    @property
+    def m_sketch_bins(self):
+        return self.sketch_bins * 2
         
     def parse(self):
         """
