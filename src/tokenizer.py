@@ -16,75 +16,108 @@ class CADtokenizer:
     """
     CAD命令和参数的Tokenizer类。
     负责将CAD命令和参数转换为离散的Token ID，反之亦然。
-    支持DeepCAD格式的输入输出。
     """
     def __init__(self, cfg):
         self.cfg = cfg
         
         # --- 1. 命令词表 ---
-        # 对应 DeepCAD/Drawing2CAD 的命令类型
-
-        # 修复特殊标记
-        self.cmd_vocab = {"PAD": 0, "SOS": 1, "EOS": 2}
-        next_idx = 3 # 意思是从3开始给命令编号
-
-        # 将 CAD_COMMANDS 添加到词表，分配新的连续ID
-        # 确保如果 CAD_COMMANDS 中存在 'EOS'，不会重复添加
-        for cmd in CAD_COMMANDS:
-            if cmd not in self.cmd_vocab: # 'EOS' 已经定义，如果在 CAD_COMMANDS 中出现，将被跳过
-                self.cmd_vocab[cmd] = next_idx
-                next_idx += 1
+        # 遵循DeepCAD/vec data的编码顺序，先从CAD_COMMANDS列表构建
+        self.cmd_vocab = {cmd: i for i, cmd in enumerate(CAD_COMMANDS)}
         
-        self.id2cmd = {v: k for k, v in self.cmd_vocab.items()}#格式转化为 {id：命令}
+        # 添加不在CAD_COMMANDS中的特殊符号
+        if 'PAD' not in self.cmd_vocab:
+            self.cmd_vocab['PAD'] = len(self.cmd_vocab)
+        if 'SOS' not in self.cmd_vocab:
+            self.cmd_vocab['SOS'] = len(self.cmd_vocab)
+        
+        self.id2cmd = {v: k for k, v in self.cmd_vocab.items()}
         self.n_commands = len(self.cmd_vocab)
 
-        # 将命令ID存储为实例变量，方便在tokenize_sequence中直接使用
-        self.CAD_LINE_IDX = self.cmd_vocab["Line"]
-        self.CAD_ARC_IDX = self.cmd_vocab["Arc"]
-        self.CAD_CIRCLE_IDX = self.cmd_vocab["Circle"]
-        self.CAD_EOS_IDX = self.cmd_vocab["EOS"]
-        self.CAD_SOL_IDX = self.cmd_vocab["SOL"]
-        self.CAD_EXT_IDX = self.cmd_vocab["Ext"]
-        "后期可以配置到macro.py中"
+        # 将命令ID存储为实例变量
+        self.CAD_LINE_IDX = self.cmd_vocab.get("Line")
+        self.CAD_ARC_IDX = self.cmd_vocab.get("Arc")
+        self.CAD_CIRCLE_IDX = self.cmd_vocab.get("Circle")
+        self.CAD_EOS_IDX = self.cmd_vocab.get("EOS")
+        self.CAD_SOL_IDX = self.cmd_vocab.get("SOL")
+        self.CAD_EXT_IDX = self.cmd_vocab.get("Ext")
 
-        # --- 2. 从 cfg 读取基础几何参数 ---
-        self.n_bins = cfg.n_bins # 通用参数量化等级256
-        self.min_val = cfg.min_val # 通用参数最小值-1.0
-        self.max_val = cfg.max_val # 通用参数最大值1.0
+        # --- 2. 从 cfg 读取参数 ---
+        self.pad_val = cfg.pad_val
+        self.angle_bins = cfg.angle_bins
+        self.pos_grid_size = cfg.pos_grid_size
+        self.cad_n_args = cfg.cad_n_args
+        self.cad_n_args_sketch = cfg.cad_n_args_sketch
         
-        # --- 3. 从 cfg 读取空间Token配置 ---
-        self.angle_bins = cfg.angle_bins # 角度量化等级
-        self.pos_grid_size = cfg.pos_grid_size # 空间位置网格大小
-        self.sketch_bins = cfg.sketch_bins # 新增：2D草图坐标的量化等级
+    def tokenize_from_vec(self, vec_data):
+        """
+        将来自HDF5文件的、已经量化但未组合的 (N, 17) 矩阵进行最终的Token化。
+        """
+        command_ids = []
+        args_ids = []
         
-        self.n_angle_tokens = cfg.n_angle_tokens
-        self.n_pos_tokens = cfg.n_pos_tokens
-        self.n_sketch_tokens = cfg.n_sketch_tokens
+        for row in vec_data:
+            cmd_id = int(row[0])
+            quantized_params = row[1:] # 16个已量化的整数参数
+            
+            command_ids.append(cmd_id)
+            
+            # 初始化最终的12维参数向量
+            final_args = [self.pad_val] * self.cad_n_args
 
-    # ================= 核心功能：数值 -> Token ID =================
+            if cmd_id in [self.CAD_LINE_IDX, self.CAD_ARC_IDX, self.CAD_CIRCLE_IDX]:
+                # 对于草图命令，HDF5中的前5个参数就是最终参数
+                # 直接复制这些已经量化好的整数
+                for i in range(self.cad_n_args_sketch):
+                    final_args[i] = int(quantized_params[i])
+
+            elif cmd_id == self.CAD_EXT_IDX:
+                # 对于拉伸命令，我们需要将多个量化整数组合成空间Token
+                
+                # --- 组合角度Token ---
+                # HDF5中拉伸参数从第5个索引开始，对应theta, phi, gamma的量化值
+                t_idx_quant = int(quantized_params[5])
+                p_idx_quant = int(quantized_params[6])
+                g_idx_quant = int(quantized_params[7])
+                
+                # 仅在所有索引都有效时才组合
+                if all(idx != self.pad_val for idx in [t_idx_quant, p_idx_quant, g_idx_quant]):
+                    angle_token = g_idx_quant * (self.angle_bins ** 2) + p_idx_quant * self.angle_bins + t_idx_quant
+                    final_args[5] = angle_token # 存入12维向量的第5个槽位
+
+                # --- 组合位置Token ---
+                # HDF5中位置参数对应 px, py, pz的量化值
+                ix_quant = int(quantized_params[8])
+                iy_quant = int(quantized_params[9])
+                iz_quant = int(quantized_params[10])
+
+                if all(idx != self.pad_val for idx in [ix_quant, iy_quant, iz_quant]):
+                    pos_token = iz_quant * (self.pos_grid_size ** 2) + iy_quant * self.pos_grid_size + ix_quant
+                    final_args[6] = pos_token # 存入12维向量的第6个槽位
+                
+                # --- 其他拉伸参数 ---
+                # s, e1, e2, b, u 对应 HDF5 中索引 11 到 15
+                for i in range(5):
+                    if quantized_params[11 + i] != self.pad_val:
+                        final_args[7 + i] = int(quantized_params[11 + i])
+
+            # 对于 SOL 和 EOS, final_args 保持为 PAD
+            
+            args_ids.append(final_args)
+            
+        return command_ids, args_ids
+
+# --- 用于将浮点数转换为Token的辅助函数 (参考) ---
+# 注意：这些函数在处理H5数据时不再直接使用，但保留作为逻辑参考和未来使用
     
     def quantize_val(self, val):
         """将 [-1, 1] 的浮点数映射到 [0, n_bins-1], 用于通用参数"""
-        val = np.clip(val, self.min_val, self.max_val)#clip实现
-        norm = (val - self.min_val) / (self.max_val - self.min_val)
-        return int(norm * (self.n_bins - 1))
-
-    def encode_sketch_x(self, x):
-        """将2D X坐标编码为独立的 <SlX> Token ID [0, 127]"""
-        x_norm = (np.clip(x, self.min_val, self.max_val) - self.min_val) / (self.max_val - self.min_val)
-        return int(x_norm * (self.sketch_bins - 1))
-
-    def encode_sketch_y(self, y):
-        """将2D Y坐标编码为独立的 <SmY> Token ID [128, 255]"""
-        y_norm = (np.clip(y, self.min_val, self.max_val) - self.min_val) / (self.max_val - self.min_val)
-        # 添加偏移量以区分X和Y
-        return int(y_norm * (self.sketch_bins - 1)) + self.sketch_bins
+        val = np.clip(val, self.cfg.min_val, self.cfg.max_val)
+        norm = (val - self.cfg.min_val) / (self.cfg.max_val - self.cfg.min_val)
+        return int(norm * (self.cfg.n_bins - 1))
 
     def encode_angle(self, theta, phi, gamma):
         """
         将三个欧拉角 (范围 [0, 2*pi]) 编码为一个 <A_n> Token ID。
-        实现了 CAD-GPT 论文公式 (2)。
-        按照 theta (低位) -> phi -> gamma (高位) 的顺序进行组合编码。
         """
         theta_norm = np.clip(theta, 0, 2 * np.pi) / (2 * np.pi)
         phi_norm = np.clip(phi, 0, 2 * np.pi) / (2 * np.pi)
@@ -94,140 +127,26 @@ class CADtokenizer:
         p_idx = int(phi_norm * (self.angle_bins - 1))
         g_idx = int(gamma_norm * (self.angle_bins - 1))
         
-        # 扁平化索引: 按照 gamma (高位) -> phi -> theta (低位) 的顺序
         token_id = g_idx * (self.angle_bins ** 2) + p_idx * self.angle_bins + t_idx
         return token_id
 
-    def encode_pos(self, px, py, pz):
-        """
-        将 (px, py, pz) (范围 [-1, 1]) 编码为一个 <P_k> Token ID。
-        实现了 CAD-GPT 论文公式 (3)。
-        """
-        def norm(v): return (np.clip(v, self.min_val, self.max_val) - self.min_val) / (self.max_val - self.min_val)
-        
-        ix = int(norm(px) * (self.pos_grid_size - 1))
-        iy = int(norm(py) * (self.pos_grid_size - 1))
-        iz = int(norm(pz) * (self.pos_grid_size - 1))
-        
-        token_id = iz * (self.pos_grid_size ** 2) + iy * self.pos_grid_size + ix
-        return token_id
-
-    # ================= 核心功能：Token ID -> 数值 =================
-    
-    def dequantize_val(self, token_id):
-        """将 [0, n_bins-1] 的ID反量化为 [-1, 1] 的浮点数"""
-        norm = token_id / (self.n_bins - 1)
-        return norm * (self.max_val - self.min_val) + self.min_val
-
-    def decode_sketch_coord(self, token_id):
-        """将 <SlX> 或 <SmY> Token ID 解码回其原始2D坐标值"""
-        if 0 <= token_id < self.sketch_bins: # X-coord
-            norm = token_id / (self.sketch_bins - 1)
-        elif self.sketch_bins <= token_id < self.sketch_bins * 2: # Y-coord
-            norm = (token_id - self.sketch_bins) / (self.sketch_bins - 1)
-        else:
-            raise ValueError(f"Invalid sketch token ID: {token_id}")
-        
-        return norm * (self.max_val - self.min_val) + self.min_val
-
-    def decode_angle(self, token_id):
-        """
-        将 <A_n> Token ID 解码回三个欧拉角 (范围 [0, 2*pi])。
-        按照 gamma (高位) -> phi -> theta (低位) 的顺序进行反向解码。
-        """
-        # 逆向扁平化
-        t_idx = token_id % self.angle_bins # 提取最低有效位
-        token_id //= self.angle_bins
-        p_idx = token_id % self.angle_bins # 提取中间位
-        g_idx = token_id // self.angle_bins # 提取最高有效位
-
-        theta_norm = t_idx / (self.angle_bins - 1)
-        phi_norm = p_idx / (self.angle_bins - 1)
-        gamma_norm = g_idx / (self.angle_bins - 1)
-        
-        theta = theta_norm * 2 * np.pi
-        phi = phi_norm * 2 * np.pi
-        gamma = gamma_norm * 2 * np.pi
-
-        return theta, phi, gamma
-
-    def decode_pos(self, token_id):
-        """将 <P_k> Token ID 解码回 (px, py, pz) 坐标 (范围 [-1, 1])"""
-        ix = token_id % self.pos_grid_size
-        token_id //= self.pos_grid_size
-        iy = token_id % self.pos_grid_size
-        iz = token_id // self.pos_grid_size
-
-        px_norm = ix / (self.pos_grid_size - 1)
-        py_norm = iy / (self.pos_grid_size - 1)
-        pz_norm = iz / (self.pos_grid_size - 1)
-
-        px = px_norm * (self.max_val - self.min_val) + self.min_val
-        py = py_norm * (self.max_val - self.min_val) + self.min_val
-        pz = pz_norm * (self.max_val - self.min_val) + self.min_val
-        
-        return px, py, pz
-
-    def tokenize_sequence(self, raw_sequence):
-        """
-        将DeepCAD原始JSON序列转换为Token ID序列。
-        """
-        command_ids = []
-        args_ids = []
-
-        for op in raw_sequence:
-            cmd_str = op["command"]
-            cmd_id = self.cmd_vocab.get(cmd_str)
-            if cmd_id is None:
-                raise ValueError(f"Unknown command: {cmd_str}")
-
-            command_ids.append(cmd_id)
-
-            current_args = [PAD_VAL] * CAD_N_ARGS # Initialize with PAD_VAL
-            params = op["parameters"]
-
-            if cmd_id == self.CAD_LINE_IDX: # Line: x, y (params 0, 1)
-                current_args[0] = self.encode_sketch_x(params[0]) # x
-                current_args[1] = self.encode_sketch_y(params[1]) # y
-            elif cmd_id == self.CAD_ARC_IDX: # Arc: x, y, alpha, f (params 0, 1, 2, 3)
-                current_args[0] = self.encode_sketch_x(params[0]) # x
-                current_args[1] = self.encode_sketch_y(params[1]) # y
-                # alpha 和 f 是通用参数，继续使用 quantize_val
-                current_args[2] = self.quantize_val(params[2]) # alpha
-                current_args[3] = self.quantize_val(params[3]) # f
-            elif cmd_id == self.CAD_CIRCLE_IDX: # Circle: x, y, r (params 0, 1, 4)
-                current_args[0] = self.encode_sketch_x(params[0]) # x
-                current_args[1] = self.encode_sketch_y(params[1]) # y
-                # r (半径) 是通用参数
-                current_args[4] = self.quantize_val(params[4]) # r
-            elif cmd_id == self.CAD_EXT_IDX: # Extrude
-                # Angle token
-                theta, phi, gamma = params[0], params[1], params[2]
-                angle_token = self.encode_angle(theta, phi, gamma)
-                current_args[CAD_N_ARGS_SKETCH + 0] = angle_token # Slot 5
-                # Position token
-                px, py, pz = params[3], params[4], params[5]
-                pos_token = self.encode_pos(px, py, pz)
-                current_args[CAD_N_ARGS_SKETCH + 1] = pos_token # Slot 6
-                # Other extrusion params are generic
-                for i in range(6, 11):
-                    current_args[CAD_N_ARGS_SKETCH + (i - 4)] = self.quantize_val(params[i])
-            
-            args_ids.append(current_args)
-        
-        return command_ids, args_ids
-
 # 测试代码
-if __name__ == "__main__":
+if __name__ == '__main__':
     class MockConfig:
         def __init__(self):
+            # 属性以匹配CADtokenizer的__init__
+            self.pad_val = -1
+            self.cad_n_args = 12
+            self.cad_n_args_sketch = 5
+            self.angle_bins = 9
+            self.pos_grid_size = 36
+            # 以下属性在tokenize_from_vec中不直接使用，但为保持兼容性而提供
             self.n_bins = 256
             self.sketch_bins = 128
             self.min_val = -1.0
             self.max_val = 1.0
-            self.angle_bins = 9
-            self.pos_grid_size = 36
         
+        # 这些属性的getter在当前测试中不是必需的，但为了完整性而保留
         @property
         def n_angle_tokens(self): return self.angle_bins ** 3
         @property
@@ -237,64 +156,51 @@ if __name__ == "__main__":
 
     cfg = MockConfig()
     tok = CADtokenizer(cfg)
-    print(f"命令词表大小: {tok.n_commands}")
-    print(f"2D草图Token数量: {tok.n_sketch_tokens}") # 应为 256
-    print(f"角度Token数量: {tok.n_angle_tokens}") # 应为 729
-    print(f"位置Token数量: {tok.n_pos_tokens}")   # 应为 46656
     
-    # Test `encode_angle` with new order
-    test_theta, test_phi, test_gamma = np.pi/4, np.pi/2, 3*np.pi/4 # 真实弧度值
-    angle_token = tok.encode_angle(test_theta, test_phi, test_gamma)
-    print(f"\n--- Testing Angle Tokens (new order) ---")
-    print(f"原始角度: ({test_theta:.4f}, {test_phi:.4f}, {test_gamma:.4f})")
-    print(f"编码Token: {angle_token}")
-    
-    decoded_theta, decoded_phi, decoded_gamma = tok.decode_angle(angle_token)
-    print(f"解码角度: ({decoded_theta:.4f}, {decoded_phi:.4f}, {decoded_gamma:.4f})")
-    
-    # Verify round-trip (allow for quantization error)
-    assert np.isclose(test_theta, decoded_theta, atol=2*np.pi/(tok.angle_bins-1)), "Theta round-trip failed"
-    assert np.isclose(test_phi, decoded_phi, atol=2*np.pi/(tok.angle_bins-1)), "Phi round-trip failed"
-    assert np.isclose(test_gamma, decoded_gamma, atol=2*np.pi/(tok.angle_bins-1)), "Gamma round-trip failed"
-    print("角度Token编码-解码往返测试通过！")
+    # --- 测试 tokenize_from_vec ---
+    print("\n--- Testing tokenize_from_vec ---")
+    # 模拟从HDF5文件读取的数据, 使用正确的命令ID
+    # CAD_COMMANDS = ['Line', 'Arc', 'Circle', 'EOS', 'SOL', 'Ext']
+    # ID ->           0,     1,      2,       3,     4,     5
+    mock_h5_data = np.array([
+        [  4, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1], # SOL
+        [  2, 176, 128, -1, -1, 48, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1], # Circle
+        [  5, -1, -1, -1, -1, -1, 6, 4, 2, 18, 18, 18, 30, -1, -1, -1, -1],   # Extrude, t=6, p=4, g=2, x=18, y=18, z=18, s=30
+        [  3, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1]  # EOS
+    ], dtype=np.int64)
 
-    # Test `encode_sketch_x/y`
-    x_val, y_val = 0.5, -0.5
-    x_token = tok.encode_sketch_x(x_val)
-    y_token = tok.encode_sketch_y(y_val)
-    print(f"\n--- Testing 2D Sketch Tokens ---")
-    print(f"X coord {x_val} -> Token {x_token} (范围 [0, 127])")
-    print(f"Y coord {y_val} -> Token {y_token} (范围 [128, 255])")
-    
-    decoded_x = tok.decode_sketch_coord(x_token)
-    decoded_y = tok.decode_sketch_coord(y_token)
-    print(f"Token {x_token} -> Decoded X: {decoded_x:.4f}")
-    print(f"Token {y_token} -> Decoded Y: {decoded_y:.4f}")
-    
-    # Verify round-trip for sketch coords
-    assert np.isclose(x_val, decoded_x, atol=2/(tok.sketch_bins-1)), "X sketch round-trip failed"
-    assert np.isclose(y_val, decoded_y, atol=2/(tok.sketch_bins-1)), "Y sketch round-trip failed"
-    print("2D草图Token编码-解码往返测试通过！")
+    command_ids, args_ids = tok.tokenize_from_vec(mock_h5_data)
 
+    print("原始H5数据 (部分):")
+    print(mock_h5_data[:4, :])
+    
+    print("\n转换后的 Command IDs:")
+    print(command_ids)
 
-    # Test `tokenize_sequence`
-    sample_raw_sequence = [
-        {"command": "Line", "parameters": [0.1, 0.2, 0.0, 0.0, 0.0]},
-        {"command": "Ext", "parameters": [np.pi/4, np.pi/2, 3*np.pi/4, -0.4, -0.5, -0.6, 0.7, 0.8, 0.9, 0.1, 0.2]}
-    ]
-    print("\n--- Testing tokenize_sequence with 'Line' and 'Ext' ---")
-    command_ids, args_ids = tok.tokenize_sequence(sample_raw_sequence)
+    print("\n转换后的 Args IDs (12维):")
+    for i, args in enumerate(args_ids):
+        cmd_name = tok.id2cmd[command_ids[i]]
+        print(f"  {cmd_name}: {args}")
+
+    # 验证Extrude的组合Token
+    ext_args = args_ids[2]
+    expected_angle_token = 2 * (9**2) + 4 * 9 + 6 # g*81 + p*9 + t
+    expected_pos_token = 18 * (36**2) + 18 * 36 + 18 # z*1296 + y*36 + x
+    print(f"\n验证 'Ext' 的组合Token:")
+    print(f"  - Angle Token: {ext_args[5]} (预期: {expected_angle_token})")
+    print(f"  - Pos Token: {ext_args[6]} (预期: {expected_pos_token})")
+    assert ext_args[5] == expected_angle_token
+    assert ext_args[6] == expected_pos_token
+    print("  组合Token测试通过！")
+
+    # 验证Circle的参数
+    circle_args = args_ids[1]
+    assert circle_args[0] == 176
+    assert circle_args[1] == 128
+    assert circle_args[4] == 48
+    print("\n验证 'Circle' 的参数: 通过！")
     
-    # Line command args
-    print(f"命令 0: {tok.id2cmd[command_ids[0]]}")
-    print(f"  Args[0:2]: [{args_ids[0][0]}, {args_ids[0][1]}]")
-    print(f"  Decoded X: {tok.decode_sketch_coord(args_ids[0][0]):.4f}, Decoded Y: {tok.decode_sketch_coord(args_ids[0][1]):.4f}")
-    
-    # Extrude command args
-    print(f"命令 1: {tok.id2cmd[command_ids[1]]}")
-    print(f"  Angle Token: {args_ids[1][CAD_N_ARGS_SKETCH + 0]}, Pos Token: {args_ids[1][CAD_N_ARGS_SKETCH + 1]}")
-    dec_t, dec_p, dec_g = tok.decode_angle(args_ids[1][CAD_N_ARGS_SKETCH + 0])
-    print(f"  Decoded Ext Angle: ({dec_t:.4f}, {dec_p:.4f}, {dec_g:.4f})")
-    dec_px, dec_py, dec_pz = tok.decode_pos(args_ids[1][CAD_N_ARGS_SKETCH + 1])
-    print(f"  Decoded Ext Pos: ({dec_px:.4f}, {dec_py:.4f}, {dec_pz:.4f})")
-    print("tokenize_sequence 测试通过！")
+    # 验证SOL和EOS
+    assert args_ids[0] == [-1] * 12
+    assert args_ids[3] == [-1] * 12
+    print("验证 'SOL' 和 'EOS' 的参数: 通过！")

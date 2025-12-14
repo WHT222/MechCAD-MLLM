@@ -63,7 +63,9 @@ class Config(object):#配置类
         self.d_model = 256               # Transformer config: model dimensionality，即嵌入向量的维度
         self.dropout = 0.1               # Dropout rate used in basic layers and Transformers
         self.dim_z = 256                 # Latent vector dimensionality，即潜在向量的维度
-
+        
+        self.pad_val = -1 #填充值
+        
         self.cad_max_n_ext = CAD_MAX_N_EXT # cad最大挤出数
         self.cad_max_n_loops = CAD_MAX_N_LOOPS # cad最大环数
         self.cad_max_n_curves = CAD_MAX_N_CURVES # cad最大曲线数
