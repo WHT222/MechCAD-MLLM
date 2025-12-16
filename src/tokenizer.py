@@ -1,206 +1,378 @@
+import json
+import math
 import numpy as np
-import torch
+from scipy.spatial.transform import Rotation
 import sys
 import os
-# 设置工作目录为项目根目录
+
+# 将项目根目录添加到sys.path，确保可以导入config.macro
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, project_root)
-os.chdir(project_root)               
-from config.macro import (
-    CAD_N_ARGS, PAD_VAL, CAD_COMMANDS,
-    CAD_N_ARGS_SKETCH
-)
-from config.config import Config               
+sys.path.append(project_root)
 
-class CADtokenizer:
+from config import macro # 导入 macro.py
+
+class CADTokenizer:
     """
-    CAD命令和参数的Tokenizer类。
-    负责将CAD命令和参数转换为离散的Token ID，反之亦然。
+    一个分词器，用于将CAD模型的连续几何参数转换为离散的Token ID。
+    它主要负责参数值的量化，命令的索引直接来自 config/macro.py。
     """
-    def __init__(self, cfg):
-        self.cfg = cfg
-        
-        # --- 1. 命令词表 ---
-        # 遵循DeepCAD/vec data的编码顺序，先从CAD_COMMANDS列表构建
-        self.cmd_vocab = {cmd: i for i, cmd in enumerate(CAD_COMMANDS)}
-        
-        # 添加不在CAD_COMMANDS中的特殊符号
-        if 'PAD' not in self.cmd_vocab:
-            self.cmd_vocab['PAD'] = len(self.cmd_vocab)
-        if 'SOS' not in self.cmd_vocab:
-            self.cmd_vocab['SOS'] = len(self.cmd_vocab)
-        
-        self.id2cmd = {v: k for k, v in self.cmd_vocab.items()}
-        self.n_commands = len(self.cmd_vocab)
-
-        # 将命令ID存储为实例变量
-        self.CAD_LINE_IDX = self.cmd_vocab.get("Line")
-        self.CAD_ARC_IDX = self.cmd_vocab.get("Arc")
-        self.CAD_CIRCLE_IDX = self.cmd_vocab.get("Circle")
-        self.CAD_EOS_IDX = self.cmd_vocab.get("EOS")
-        self.CAD_SOL_IDX = self.cmd_vocab.get("SOL")
-        self.CAD_EXT_IDX = self.cmd_vocab.get("Ext")
-
-        # --- 2. 从 cfg 读取参数 ---
-        self.pad_val = cfg.pad_val
-        self.angle_bins = cfg.angle_bins
-        self.pos_grid_size = cfg.pos_grid_size
-        self.cad_n_args = cfg.cad_n_args
-        self.cad_n_args_sketch = cfg.cad_n_args_sketch
-        
-    def tokenize_from_vec(self, vec_data):
+    def __init__(self, vocab_path='config/vocab.json'):
         """
-        将来自HDF5文件的、已经量化但未组合的 (N, 17) 矩阵进行最终的Token化。
+        初始化分词器，加载参数值的词汇表。
         """
-        command_ids = []
-        args_ids = []
+        with open(vocab_path, 'r') as f:
+            vocab_data = json.load(f)
+
+        self.token_to_id = {}
+        # 1. 加载特殊 token
+        self.token_to_id.update(vocab_data['special_tokens'])
         
-        for row in vec_data:
-            cmd_id = int(row[0])
-            quantized_params = row[1:] # 16个已量化的整数参数
-            
-            command_ids.append(cmd_id)
-            
-            # 初始化最终的12维参数向量
-            final_args = [self.pad_val] * self.cad_n_args
+        # 2. 动态生成并加载量化值 token (P, A, V, BOOL)
+        self.value_ranges = vocab_data['value_token_ranges']
+        for key, value in self.value_ranges.items():
+            prefix = key.split('_')[0]
+            start_id = value['start_id']
+            num_bins = value['num_bins']
+            for i in range(num_bins):
+                self.token_to_id[f"<{prefix}_{i}>"] = start_id + i
 
-            if cmd_id in [self.CAD_LINE_IDX, self.CAD_ARC_IDX, self.CAD_CIRCLE_IDX]:
-                # 对于草图命令，HDF5中的前5个参数就是最终参数
-                # 直接复制这些已经量化好的整数
-                for i in range(self.cad_n_args_sketch):
-                    final_args[i] = int(quantized_params[i])
+        self.id_to_token = {v: k for k, v in self.token_to_id.items()}
 
-            elif cmd_id == self.CAD_EXT_IDX:
-                # 对于拉伸命令，我们需要将多个量化整数组合成空间Token
-                
-                # --- 组合角度Token ---
-                # HDF5中拉伸参数从第5个索引开始，对应theta, phi, gamma的量化值
-                t_idx_quant = int(quantized_params[5])
-                p_idx_quant = int(quantized_params[6])
-                g_idx_quant = int(quantized_params[7])
-                
-                # 仅在所有索引都有效时才组合
-                if all(idx != self.pad_val for idx in [t_idx_quant, p_idx_quant, g_idx_quant]):
-                    angle_token = g_idx_quant * (self.angle_bins ** 2) + p_idx_quant * self.angle_bins + t_idx_quant
-                    final_args[5] = angle_token # 存入12维向量的第5个槽位
-
-                # --- 组合位置Token ---
-                # HDF5中位置参数对应 px, py, pz的量化值
-                ix_quant = int(quantized_params[8])
-                iy_quant = int(quantized_params[9])
-                iz_quant = int(quantized_params[10])
-
-                if all(idx != self.pad_val for idx in [ix_quant, iy_quant, iz_quant]):
-                    pos_token = iz_quant * (self.pos_grid_size ** 2) + iy_quant * self.pos_grid_size + ix_quant
-                    final_args[6] = pos_token # 存入12维向量的第6个槽位
-                
-                # --- 其他拉伸参数 ---
-                # s, e1, e2, b, u 对应 HDF5 中索引 11 到 15
-                for i in range(5):
-                    if quantized_params[11 + i] != self.pad_val:
-                        final_args[7 + i] = int(quantized_params[11 + i])
-
-            # 对于 SOL 和 EOS, final_args 保持为 PAD
-            
-            args_ids.append(final_args)
-            
-        return command_ids, args_ids
-
-# --- 用于将浮点数转换为Token的辅助函数 (参考) ---
-# 注意：这些函数在处理H5数据时不再直接使用，但保留作为逻辑参考和未来使用
+        # 常用 Token ID
+        self.sos_token_id = self.token_to_id.get('<sos>')
+        self.eos_token_id = self.token_to_id.get('<eos>')
+        self.pad_token_id = self.token_to_id.get('<pad>')
+        self.unk_token_id = self.token_to_id.get('<unk>')
+        self.empty_token_id = self.token_to_id.get('<empty>') # 用于参数向量中的空槽位
     
-    def quantize_val(self, val):
-        """将 [-1, 1] 的浮点数映射到 [0, n_bins-1], 用于通用参数"""
-        val = np.clip(val, self.cfg.min_val, self.cfg.max_val)
-        norm = (val - self.cfg.min_val) / (self.cfg.max_val - self.cfg.min_val)
-        return int(norm * (self.cfg.n_bins - 1))
+    def get_vocab_size(self):
+        """获取参数值 Token 词汇表的大小"""
+        return len(self.token_to_id)
 
-    def encode_angle(self, theta, phi, gamma):
-        """
-        将三个欧拉角 (范围 [0, 2*pi]) 编码为一个 <A_n> Token ID。
-        """
-        theta_norm = np.clip(theta, 0, 2 * np.pi) / (2 * np.pi)
-        phi_norm = np.clip(phi, 0, 2 * np.pi) / (2 * np.pi)
-        gamma_norm = np.clip(gamma, 0, 2 * np.pi) / (2 * np.pi)
+    def _normalize_value(self, value, min_val, max_val):
+        """将一个值从 [min_val, max_val] 归一化到 [0, 1]"""
+        if max_val <= min_val: # 避免除以零或范围为零的情况
+            return 0.5 # 返回中间值
+        return np.clip((value - min_val) / (max_val - min_val), 0.0, 1.0)
 
-        t_idx = int(theta_norm * (self.angle_bins - 1))
-        p_idx = int(phi_norm * (self.angle_bins - 1))
-        g_idx = int(gamma_norm * (self.angle_bins - 1))
+    def _quantize_value(self, normalized_value, num_bins):
+        """将一个 [0, 1] 范围内的归一化值量化到 [0, num_bins-1] 的整数 bin"""
+        return math.floor(normalized_value * (num_bins - 1e-6))
+
+    def _get_bbox_max_dim(self, bbox):
+        """计算边界框的最大维度，用于归一化"""
+        min_pt = bbox['min_point']
+        max_pt = bbox['max_point']
+        max_dim = max(
+            max_pt['x'] - min_pt['x'],
+            max_pt['y'] - min_pt['y'],
+            max_pt['z'] - min_pt['z']
+        )
+        return max_dim if max_dim > 1e-6 else 1.0
+
+    def tokenize_scalar_param(self, raw_value, bbox):
+        """将标量参数（如x, y, radius, distance）量化为一个 V_token ID"""
+        # 归一化策略：所有坐标和距离都相对于整个模型 bbox 的最大尺寸进行归一化
+        max_dim = self._get_bbox_max_dim(bbox)
+        # 假设参数值可能在 [-max_dim/2, max_dim/2] 之间，归一化到 [0, max_dim]
+        # 这里的 min_val 和 max_val 需要根据实际数据范围调整
+        normalized_val = self._normalize_value(raw_value, -max_dim/2, max_dim/2)
         
-        token_id = g_idx * (self.angle_bins ** 2) + p_idx * self.angle_bins + t_idx
-        return token_id
+        v_bin = self._quantize_value(normalized_val, self.value_ranges['V_tokens']['num_bins'])
+        return self.value_ranges['V_tokens']['start_id'] + v_bin
 
-# 测试代码
+    def tokenize_3d_point_param(self, point_dict, bbox):
+        """将 3D 点 (例如草图平面原点) 量化为一个 P_token ID"""
+        k = int(round(self.value_ranges['P_tokens']['num_bins']**(1/3))) # 应该是36
+        max_dim = self._get_bbox_max_dim(bbox)
+        min_pt_x = bbox['min_point']['x']
+        min_pt_y = bbox['min_point']['y']
+        min_pt_z = bbox['min_point']['z']
+
+        # 将点坐标归一化到 [0, 1]
+        norm_x = self._normalize_value(point_dict['x'], min_pt_x, min_pt_x + max_dim)
+        norm_y = self._normalize_value(point_dict['y'], min_pt_y, min_pt_y + max_dim)
+        norm_z = self._normalize_value(point_dict['z'], min_pt_z, min_pt_z + max_dim)
+
+        ix = self._quantize_value(norm_x, k)
+        iy = self._quantize_value(norm_y, k)
+        iz = self._quantize_value(norm_z, k)
+
+        # 索引计算 (z -> y -> x 顺序)
+        p_index = iz * (k**2) + iy * k + ix
+        return self.value_ranges['P_tokens']['start_id'] + p_index
+
+    def tokenize_axes_param(self, x_axis, y_axis, z_axis):
+        """将轴向量定义的旋转矩阵转换为欧拉角，再量化为一个 A_token ID"""
+        try:
+            # 构建旋转矩阵
+            rot_matrix = np.array([
+                [x_axis['x'], y_axis['x'], z_axis['x']],
+                [x_axis['y'], y_axis['y'], z_axis['y']],
+                [x_axis['z'], y_axis['z'], z_axis['z']]
+            ])
+            # 从旋转矩阵获取欧拉角 (弧度)，使用 'xyz' 约定
+            r = Rotation.from_matrix(rot_matrix)
+            euler_angles = r.as_euler('xyz', degrees=False)
+            theta, phi, gamma = euler_angles[0], euler_angles[1], euler_angles[2]
+        except Exception:
+            # 如果转换失败（例如矩阵不正交），使用默认值 (0,0,0)
+            theta, phi, gamma = 0.0, 0.0, 0.0
+        
+        n_bins = int(round(self.value_ranges['A_tokens']['num_bins']**(1/3))) # 应该是9
+
+        # 将角度从 [-pi, pi] 归一化到 [0, 1]
+        norm_theta = (theta + np.pi) / (2 * np.pi)
+        norm_phi = (phi + np.pi) / (2 * np.pi)
+        norm_gamma = (gamma + np.pi) / (2 * np.pi)
+        
+        i_theta = self._quantize_value(norm_theta, n_bins)
+        i_phi = self._quantize_value(norm_phi, n_bins)
+        i_gamma = self._quantize_value(norm_gamma, n_bins)
+        
+        # 索引计算
+        a_index = i_theta * (n_bins**2) + i_phi * n_bins + i_gamma
+        return self.value_ranges['A_tokens']['start_id'] + a_index
+        
+    def tokenize_boolean_op_param(self, operation_str):
+        """将拉伸操作字符串（如 NewBody, Cut）量化为一个 BOOL_token ID"""
+        op_map = {
+            "NewBodyFeatureOperation": 0,
+            "JoinFeatureOperation": 0,
+            "CutFeatureOperation": 1,
+            "IntersectFeatureOperation": 2,
+        }
+        op_idx = op_map.get(operation_str, 0) # 默认为 NewBody (索引 0)
+        return self.value_ranges['BOOL_tokens']['start_id'] + op_idx
+
+    def tokenize_extent_type_param(self, extent_type_str):
+        """将挤出范围类型字符串（如 OneSide, Symmetric）量化为一个 BOOL_token ID"""
+        type_map = {
+            "OneSideFeatureExtentType": 0,
+            "SymmetricFeatureExtentType": 1,
+            "TwoSidesFeatureExtentType": 2,
+        }
+        type_idx = type_map.get(extent_type_str, 0) # 默认为 OneSide (索引 0)
+        return self.value_ranges['BOOL_tokens']['start_id'] + type_idx
+
+    def create_argument_vector(self, command_type_str, raw_params, bbox):
+        """
+        根据命令类型和原始参数，构建一个 12 维的参数 Token ID 向量。
+        参数槽位和掩码来自 config.macro。
+
+        Args:
+            command_type_str (str): 命令类型字符串 (e.g., 'Line', 'Ext').
+            raw_params (dict): 包含此命令所有原始几何参数的字典.
+            bbox (dict): 整个 CAD 模型的边界框，用于归一化。
+
+        Returns:
+            list: 包含 12 个参数 Token ID 的列表。
+        """
+        arg_vector = [self.empty_token_id] * macro.CAD_N_ARGS
+        
+        # 获取命令索引和对应的参数掩码
+        try:
+            cmd_idx = macro.CAD_COMMANDS.index(command_type_str)
+            arg_mask = macro.CAD_CMD_ARGS_MASK[cmd_idx]
+        except ValueError:
+            # 对于不在 CAD_COMMANDS 中的命令，返回全 empty 的向量
+            # 例如 'SOL', 'EOL', 'SOS', 'EOS' 等命令在 macro.py 中，但其参数掩码是全0
+            # 这里应确保这些命令有对应的索引，且掩码处理正确
+            if command_type_str in ['SOL', 'EOS']: # 这些是 macro.py 中定义的，但其参数掩码是全0
+                 return arg_vector
+            print(f"警告: 未知的命令类型 '{command_type_str}'，返回全空参数向量。 সন")
+            return arg_vector 
+
+        # 填充参数槽位 (根据 macro.CAD_CMD_ARGS_MASK 索引)
+        # CAD_N_ARGS_SKETCH = 5 # sketch parameters: x, y, alpha, f, r
+        # CAD_N_ARGS_EXT = 7 # Extrude parameters start after sketch args
+        
+        # Line 命令: 占用 sketch args 的前两个 (end_x, end_y)
+        if command_type_str == 'Line':
+            # 假设 raw_params 包含 'end_x', 'end_y'
+            # 检查掩码，确保对应槽位是活跃的
+            if arg_mask[0]: # 槽位0: end_x
+                arg_vector[0] = self.tokenize_scalar_param(raw_params.get('end_point', {}).get('x', 0.0), bbox)
+            if arg_mask[1]: # 槽位1: end_y
+                arg_vector[1] = self.tokenize_scalar_param(raw_params.get('end_point', {}).get('y', 0.0), bbox)
+        
+        # Arc 命令: 占用 sketch args 的前四个 (center_x, center_y, start_angle, end_angle)
+        elif command_type_str == 'Arc':
+            # 假设 raw_params 包含 'center_x', 'center_y', 'start_angle', 'end_angle' (或 sweep_angle, radius等)
+            # 注意：OmniCAD 的 Arc 可能有 center_point, start_point, end_point, radius, start_angle, end_angle
+            # 这里我们根据 macro.py 的参数掩码来填
+            if arg_mask[0]: # 槽位0: center_x
+                arg_vector[0] = self.tokenize_scalar_param(raw_params.get('center_point', {}).get('x', 0.0), bbox)
+            if arg_mask[1]: # 槽位1: center_y
+                arg_vector[1] = self.tokenize_scalar_param(raw_params.get('center_point', {}).get('y', 0.0), bbox)
+            if arg_mask[2]: # 槽位2: start_angle
+                arg_vector[2] = self.tokenize_scalar_param(raw_params.get('start_angle', 0.0), bbox)
+            if arg_mask[3]: # 槽位3: end_angle
+                arg_vector[3] = self.tokenize_scalar_param(raw_params.get('end_angle', 0.0), bbox)
+
+        # Circle 命令: 占用 sketch args 的 x, y, radius (根据CAD_CMD_ARGS_MASK，radius是第5个参数，即索引4)
+        elif command_type_str == 'Circle':
+            # 假设 raw_params 包含 'center_x', 'center_y', 'radius'
+            if arg_mask[0]: # 槽位0: center_x
+                arg_vector[0] = self.tokenize_scalar_param(raw_params.get('center_point', {}).get('x', 0.0), bbox)
+            if arg_mask[1]: # 槽位1: center_y
+                arg_vector[1] = self.tokenize_scalar_param(raw_params.get('center_point', {}).get('y', 0.0), bbox)
+            if arg_mask[4]: # 槽位4: radius
+                arg_vector[4] = self.tokenize_scalar_param(raw_params.get('radius', 0.0), bbox)
+        
+        # Ext 命令: 占用 Extrude 的7个参数槽位 (从索引 macro.CAD_N_ARGS_SKETCH = 5 开始)
+        elif command_type_str == 'Ext':
+            ext_args_start_idx = macro.CAD_N_ARGS_SKETCH # 5
+            
+            # 1. Plane Orientation (theta, phi, gamma) -> 1个 A_token
+            # 槽位5 (对应 CAD_N_ARGS_PLANE, 第一个 Ext 参数)
+            transform = raw_params.get('transform', {})
+            x_axis = transform.get('x_axis')
+            y_axis = transform.get('y_axis')
+            z_axis = transform.get('z_axis')
+            if arg_mask[ext_args_start_idx + 0]: 
+                # 检查轴向量是否存在
+                if x_axis and y_axis and z_axis and all(isinstance(v, dict) for v in [x_axis, y_axis, z_axis]):
+                    arg_vector[ext_args_start_idx + 0] = self.tokenize_axes_param(x_axis, y_axis, z_axis)
+                else: # 默认情况，例如没有提供transform，或者数据格式不正确
+                    # 如果没有 z_axis，可以尝试从 x, y 轴交叉积生成，但这里简化为默认 Identity
+                    arg_vector[ext_args_start_idx + 0] = self.tokenize_axes_param(
+                        {'x':1.0,'y':0.0,'z':0.0}, {'x':0.0,'y':1.0,'z':0.0}, {'x':0.0,'y':0.0,'z':1.0}, # 默认 Identity 变换
+                    )
+
+            # 2. Plane Origin (px, py, pz) -> 1个 P_token
+            # 槽位6 (对应 CAD_N_ARGS_TRANS, 第二个 Ext 参数)
+            origin_pt = transform.get('origin')
+            if arg_mask[ext_args_start_idx + 1]: 
+                if origin_pt and all(k in origin_pt for k in ['x','y','z']):
+                    arg_vector[ext_args_start_idx + 1] = self.tokenize_3d_point_param(origin_pt, bbox)
+            
+            # 3. Scale 's' (模型缩放因子，OmniCAD中不直接体现，用最大尺寸代表) -> 1个 V_token
+            # 槽位7 (对应 CAD_N_ARGS_TRANS, 第三个 Ext 参数)
+            if arg_mask[ext_args_start_idx + 2]:
+                 arg_vector[ext_args_start_idx + 2] = self.tokenize_scalar_param(self._get_bbox_max_dim(bbox), bbox) 
+
+            # 4. Extrusion Distance e1 -> 1个 V_token
+            # 槽位8 (对应 CAD_N_ARGS_EXT_PARAM, 第四个 Ext 参数)
+            extent_one_dist = raw_params.get('extent_one', {}).get('distance', {}).get('value')
+            if arg_mask[ext_args_start_idx + 3]:
+                if extent_one_dist is not None:
+                    arg_vector[ext_args_start_idx + 3] = self.tokenize_scalar_param(extent_one_dist, bbox)
+            
+            # 5. Extrusion Distance e2 (如果存在 TwoSides) -> 1个 V_token
+            # 槽位9 (对应 CAD_N_ARGS_EXT_PARAM, 第五个 Ext 参数)
+            if arg_mask[ext_args_start_idx + 4]:
+                extent_two_dist = raw_params.get('extent_two', {}).get('distance', {}).get('value', 0.0) # 默认为0
+                arg_vector[ext_args_start_idx + 4] = self.tokenize_scalar_param(extent_two_dist, bbox)
+
+            # 6. Boolean Operation 'b' -> 1个 BOOL_token
+            # 槽位10 (对应 CAD_N_ARGS_EXT_PARAM, 第六个 Ext 参数)
+            operation_type = raw_params.get('operation')
+            if arg_mask[ext_args_start_idx + 5]:
+                if operation_type:
+                    arg_vector[ext_args_start_idx + 5] = self.tokenize_boolean_op_param(operation_type)
+            
+            # 7. Extent Type 'u' -> 1个 BOOL_token
+            # 槽位11 (对应 CAD_N_ARGS_EXT_PARAM, 第七个 Ext 参数)
+            extent_type = raw_params.get('extent_type')
+            if arg_mask[ext_args_start_idx + 6]:
+                if extent_type:
+                    arg_vector[ext_args_start_idx + 6] = self.tokenize_extent_type_param(extent_type)
+        
+        # 对于 SOL/EOL/EOS 等命令，参数槽位都为空 (会保持为 self.empty_token_id)
+        # 这些命令在 macro.py 的 CAD_CMD_ARGS_MASK 中应该都是全 0
+
+        return arg_vector
+
+
+    def decode_token(self, token_id):
+        """将单个 token ID 解码回可读的 token 字符串"""
+        return self.id_to_token.get(token_id, "<unk>")
+        
+    def decode_sequence(self, token_ids):
+        """将一系列 token ID 解码回可读的 token 字符串列表"""
+        return [self.decode_token(token_id) for token_id in token_ids]
+
 if __name__ == '__main__':
-    class MockConfig:
-        def __init__(self):
-            # 属性以匹配CADtokenizer的__init__
-            self.pad_val = -1
-            self.cad_n_args = 12
-            self.cad_n_args_sketch = 5
-            self.angle_bins = 9
-            self.pos_grid_size = 36
-            # 以下属性在tokenize_from_vec中不直接使用，但为保持兼容性而提供
-            self.n_bins = 256
-            self.sketch_bins = 128
-            self.min_val = -1.0
-            self.max_val = 1.0
-        
-        # 这些属性的getter在当前测试中不是必需的，但为了完整性而保留
-        @property
-        def n_angle_tokens(self): return self.angle_bins ** 3
-        @property
-        def n_pos_tokens(self): return self.pos_grid_size ** 3
-        @property
-        def n_sketch_tokens(self): return self.sketch_bins * 2
+    # 简单的测试
+    # 在运行前请确保 `pip install scipy numpy`
+    print("正在初始化CADTokenizer...")
+    tokenizer = CADTokenizer(vocab_path='config/vocab.json')
+    print(f"参数值和特殊Token词汇表大小: {tokenizer.get_vocab_size()}")
+    print(f"<empty> token ID: {tokenizer.empty_token_id}")
 
-    cfg = MockConfig()
-    tok = CADtokenizer(cfg)
+    # 模拟一个边界框
+    mock_bbox = {'min_point': {'x': -10.0, 'y': -10.0, 'z': -10.0}, 'max_point': {'x': 10.0, 'y': 10.0, 'z': 10.0}}
+    print(f"\n使用模拟边界框: {mock_bbox}")
+
+    # 1. 测试一个标量 (例如 Line 的 end_x)
+    val_x = 5.0
+    token_id_x = tokenizer.tokenize_scalar_param(val_x, mock_bbox)
+    print(f"标量值 {val_x} -> Token ID: {token_id_x} -> 解码: {tokenizer.decode_token(token_id_x)}")
+
+    # 2. 测试一个3D点 (例如 Extrude 的 origin)
+    point_3d = {'x': 2.0, 'y': -3.0, 'z': 4.0}
+    token_id_3d = tokenizer.tokenize_3d_point_param(point_3d, mock_bbox)
+    print(f"3D点 {point_3d} -> Token ID: {token_id_3d} -> 解码: {tokenizer.decode_token(token_id_3d)}")
+
+    # 3. 测试一组轴 (例如 Extrude 的 transform)
+    x_ax = {'x': 1, 'y': 0, 'z': 0}
+    y_ax = {'x': 0, 'y': 1, 'z': 0}
+    z_ax = {'x': 0, 'y': 0, 'z': 1} # 默认正向
+    axes_token_id = tokenizer.tokenize_axes_param(x_ax, y_ax, z_ax)
+    print(f"一组轴向量 (Identity) -> Token ID: {axes_token_id} -> 解码: {tokenizer.decode_token(axes_token_id)}")
+
+    # 4. 测试布尔操作
+    op_str = "CutFeatureOperation"
+    bool_token_id = tokenizer.tokenize_boolean_op_param(op_str)
+    print(f"布尔操作 '{op_str}' -> Token ID: {bool_token_id} -> 解码: {tokenizer.decode_token(bool_token_id)}")
     
-    # --- 测试 tokenize_from_vec ---
-    print("\n--- Testing tokenize_from_vec ---")
-    # 模拟从HDF5文件读取的数据, 使用正确的命令ID
-    # CAD_COMMANDS = ['Line', 'Arc', 'Circle', 'EOS', 'SOL', 'Ext']
-    # ID ->           0,     1,      2,       3,     4,     5
-    mock_h5_data = np.array([
-        [  4, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1], # SOL
-        [  2, 176, 128, -1, -1, 48, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1], # Circle
-        [  5, -1, -1, -1, -1, -1, 6, 4, 2, 18, 18, 18, 30, -1, -1, -1, -1],   # Extrude, t=6, p=4, g=2, x=18, y=18, z=18, s=30
-        [  3, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1]  # EOS
-    ], dtype=np.int64)
+    # 5. 测试挤出范围类型
+    extent_str = "TwoSidesFeatureExtentType"
+    extent_token_id = tokenizer.tokenize_extent_type_param(extent_str)
+    print(f"挤出范围类型 '{extent_str}' -> Token ID: {extent_token_id} -> 解码: {tokenizer.decode_token(extent_token_id)}")
 
-    command_ids, args_ids = tok.tokenize_from_vec(mock_h5_data)
 
-    print("原始H5数据 (部分):")
-    print(mock_h5_data[:4, :])
+    # --- 测试 create_argument_vector ---
+    print("\n--- 测试 create_argument_vector ---")
     
-    print("\n转换后的 Command IDs:")
-    print(command_ids)
+    # 模拟 Line 命令参数
+    line_raw_params = {'end_point': {'x': 5.0, 'y': 3.0}} # OmniCAD 的 Line 有 start_point 和 end_point
+    line_arg_vec = tokenizer.create_argument_vector('Line', line_raw_params, mock_bbox)
+    print(f"Line 参数向量: {line_arg_vec[:2]}... (前2个参数)")
+    print(f"解码 Line 参数向量: {tokenizer.decode_sequence(line_arg_vec)}")
 
-    print("\n转换后的 Args IDs (12维):")
-    for i, args in enumerate(args_ids):
-        cmd_name = tok.id2cmd[command_ids[i]]
-        print(f"  {cmd_name}: {args}")
+    # 模拟 Arc 命令参数
+    arc_raw_params = {
+        'center_point': {'x': 0.0, 'y': 0.0, 'z': 0.0},
+        'start_angle': 0.0,
+        'end_angle': np.pi / 2
+    }
+    arc_arg_vec = tokenizer.create_argument_vector('Arc', arc_raw_params, mock_bbox)
+    print(f"Arc 参数向量: {arc_arg_vec[:4]}... (前4个参数)")
+    print(f"解码 Arc 参数向量: {tokenizer.decode_sequence(arc_arg_vec)}")
 
-    # 验证Extrude的组合Token
-    ext_args = args_ids[2]
-    expected_angle_token = 2 * (9**2) + 4 * 9 + 6 # g*81 + p*9 + t
-    expected_pos_token = 18 * (36**2) + 18 * 36 + 18 # z*1296 + y*36 + x
-    print(f"\n验证 'Ext' 的组合Token:")
-    print(f"  - Angle Token: {ext_args[5]} (预期: {expected_angle_token})")
-    print(f"  - Pos Token: {ext_args[6]} (预期: {expected_pos_token})")
-    assert ext_args[5] == expected_angle_token
-    assert ext_args[6] == expected_pos_token
-    print("  组合Token测试通过！")
+    # 模拟 Circle 命令参数
+    circle_raw_params = {
+        'center_point': {'x': 0.0, 'y': 0.0, 'z': 0.0},
+        'radius': 7.5
+    }
+    circle_arg_vec = tokenizer.create_argument_vector('Circle', circle_raw_params, mock_bbox)
+    print(f"Circle 参数向量: {circle_arg_vec[0]}, {circle_arg_vec[1]}, {circle_arg_vec[4]}... (x, y, r)")
+    print(f"解码 Circle 参数向量: {tokenizer.decode_sequence(circle_arg_vec)}")
 
-    # 验证Circle的参数
-    circle_args = args_ids[1]
-    assert circle_args[0] == 176
-    assert circle_args[1] == 128
-    assert circle_args[4] == 48
-    print("\n验证 'Circle' 的参数: 通过！")
-    
-    # 验证SOL和EOS
-    assert args_ids[0] == [-1] * 12
-    assert args_ids[3] == [-1] * 12
-    print("验证 'SOL' 和 'EOS' 的参数: 通过！")
+
+    # 模拟 Extrude 命令参数
+    ext_raw_params = {
+        'transform': {'origin': {'x': 0.0, 'y': 0.0, 'z': 0.0}, 
+                      'x_axis': {'x': 1, 'y': 0, 'z': 0},
+                      'y_axis': {'x': 0, 'y': 1, 'z': 0},
+                      'z_axis': {'x': 0, 'y': 0, 'z': 1}},
+        'extent_one': {'distance': {'value': 15.0}},
+        'extent_two': {'distance': {'value': -5.0}},
+        'operation': 'CutFeatureOperation',
+        'extent_type': 'SymmetricFeatureExtentType'
+    }
+    ext_arg_vec = tokenizer.create_argument_vector('Ext', ext_raw_params, mock_bbox)
+    print(f"Ext 参数向量: {ext_arg_vec[5:]} (后7个参数)") # Ext参数从索引5开始
+    print(f"解码 Ext 参数向量: {tokenizer.decode_sequence(ext_arg_vec)}")

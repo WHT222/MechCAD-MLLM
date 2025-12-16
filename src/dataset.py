@@ -1,164 +1,253 @@
-# -*- coding: utf-8 -*-
+import os
+import json
+import numpy as np
 import torch
 from torch.utils.data import Dataset
-import h5py
-from pathlib import Path
+from torchvision.transforms import Compose, Resize, ToTensor, Normalize
+from PIL import Image
+import random # 用于随机采样视图
+from tqdm import tqdm
+import glob # 用于查找多个视图文件
+
+# 将项目根目录添加到sys.path
 import sys
-import os
-import numpy as np
-
-# 假设这个脚本位于 src/ 目录下, 为了导入同级目录的 tokenizer
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, project_root)
+sys.path.append(project_root)
 
-from src.tokenizer import CADtokenizer
-# 假设主配置文件可以被导入，如果不能，则使用下面的MockConfig
-# from config.config import Config 
+from config import macro # 导入 macro.py
 
 class CADDataset(Dataset):
-    """
-    用于加载和处理 CAD .h5 向量数据的 PyTorch 数据集。
-    """
-    def __init__(self, data_dir, config, max_len=60):
+    def __init__(self, processed_data_dir, raw_text_dir=None, raw_image_dir=None, split='train', sample_limit=None, num_views_to_sample=1):
         """
-        初始化数据集。
+        初始化 CAD 数据集。
 
         Args:
-            data_dir (str): 包含 .h5 文件的根目录 (例如 'data/raw/cad_vec')。
-            config: 包含所有配置的对象，用于初始化 CADtokenizer。
-            max_len (int): 序列的最大长度，用于填充。
+            processed_data_dir (str): 预处理后的 .npz 文件根目录 (例如 'data/processed').
+            raw_text_dir (str, optional): 原始文本描述文件 (例如 'data/raw/text/0000.json') 的路径.
+            raw_image_dir (str, optional): 原始图像文件的根目录 (例如 'data/raw/img').
+            split (str, optional): 数据集划分 ('train', 'val', 'test').
+            sample_limit (int, optional): 限制加载的样本数量，主要用于测试。默认为 None (加载所有)。
+            num_views_to_sample (int): 每次为每个样本随机采样的视图数量。默认为 1。
         """
-        super().__init__()
-        self.data_dir = Path(data_dir)
-        self.file_paths = sorted(list(self.data_dir.rglob('*.h5')))
-        
-        if not self.file_paths:
-            print(f"警告：在目录 '{data_dir}' 中没有找到任何 .h5 文件。")
+        self.processed_data_dir = processed_data_dir
+        self.raw_text_dir = raw_text_dir
+        self.raw_image_dir = raw_image_dir
+        self.split = split # TODO: 实际的 split 逻辑需要文件列表或索引
+        self.sample_limit = sample_limit
+        self.num_views_to_sample = num_views_to_sample
 
-        self.tokenizer = CADtokenizer(config)
-        self.max_len = max_len
-        self.pad_cmd_id = self.tokenizer.cmd_vocab['PAD']
-        self.pad_args = [self.tokenizer.pad_val] * self.tokenizer.cad_n_args
+        self.samples = []
+        self._load_samples()
+
+        self.text_captions = self._load_text_captions()
+
+        # 图像预处理
+        self.image_transform = Compose([
+            Resize((224, 224)), # MLLM通常期望224x224
+            ToTensor(),
+            Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]) # ImageNet 标准
+        ])
+
+    def _load_samples(self):
+        """
+        遍历预处理目录，收集所有 .npz 文件的路径。
+        """
+        print(f"正在收集 '{self.processed_data_dir}' 中的预处理样本...")
+        collected_count = 0
+        
+        # 确保目录存在
+        if not os.path.isdir(self.processed_data_dir):
+            print(f"警告: 预处理目录不存在: {self.processed_data_dir}")
+            return
+
+        for root, _, files in os.walk(self.processed_data_dir):
+            # 如果达到了样本限制，我们可以提前退出外层循环
+            if self.sample_limit is not None and collected_count >= self.sample_limit:
+                break
+                
+            for file in files:
+                if file.endswith('.npz'):
+                    # 获取文件相对于 self.processed_data_dir 的子目录路径
+                    subdir = os.path.relpath(root, self.processed_data_dir)
+                    # 获取文件名（不含后缀）
+                    filestem = os.path.splitext(file)[0]
+                    
+                    # 构造一个总是一致的 sample_id，格式为 'subdir/filestem'
+                    # 即使 subdir 是 '.' (表示在根目录)，os.path.join 也能正确处理
+                    # 为了跨平台兼容，统一使用 '/' 作为分隔符
+                    if subdir == '.':
+                        sample_id = filestem
+                    else:
+                        sample_id = os.path.join(subdir, filestem).replace(os.path.sep, '/')
+
+                    self.samples.append({
+                        'id': sample_id,
+                        'npz_path': os.path.join(root, file)
+                    })
+                    collected_count += 1
+                    if self.sample_limit is not None and collected_count >= self.sample_limit:
+                        print(f"达到样本限制 {self.sample_limit}，停止收集。")
+                        break # 退出内层循环
+        print(f"收集到 {len(self.samples)} 个样本。")
+
+    def _load_text_captions(self):
+        """
+        加载所有文本描述到内存中。
+        """
+        if not self.raw_text_dir or not os.path.exists(self.raw_text_dir):
+            return {}
+        
+        captions = {}
+        # 假设 text_dir 是一个包含多个JSON文件的目录，或者是一个单一的JSON文件
+        if os.path.isdir(self.raw_text_dir):
+            for filename in os.listdir(self.raw_text_dir):
+                if filename.endswith('.json'):
+                    filepath = os.path.join(self.raw_text_dir, filename)
+                    with open(filepath, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                        for item in data:
+                            captions[item['id']] = item['text caption']
+        elif os.path.isfile(self.raw_text_dir) and self.raw_text_dir.endswith('.json'):
+             with open(self.raw_text_dir, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                for item in data:
+                    captions[item['id']] = item['text caption']
+        
+        print(f"加载了 {len(captions)} 条文本描述。")
+        return captions
 
     def __len__(self):
-        """返回数据集中文件的总数。"""
-        return len(self.file_paths)
+        """
+        返回数据集中样本的总数。
+        """
+        return len(self.samples)
 
     def __getitem__(self, idx):
         """
-        获取并处理索引为 idx 的数据样本。
+        根据索引加载、处理并返回一个样本。
         """
-        file_path = self.file_paths[idx]
-        
-        with h5py.File(file_path, 'r') as f:
-            vec_data = f['vec'][:] # type: ignore
-        
-        # 使用tokenizer将H5的中间格式数据转换为最终的token序列
-        command_ids, args_ids = self.tokenizer.tokenize_from_vec(vec_data)
-        
-        # --- 填充/截断序列到最大长度 ---
-        seq_len = len(command_ids)
-        
-        # 1. 填充/截断命令
-        if seq_len < self.max_len:
-            padding_len = self.max_len - seq_len
-            padded_command_ids = command_ids + [self.pad_cmd_id] * padding_len
-        else:
-            padded_command_ids = command_ids[:self.max_len]
-        
-        # 2. 填充/截断参数
-        if seq_len < self.max_len:
-            padding_len = self.max_len - seq_len
-            padded_args_ids = args_ids + [self.pad_args] * padding_len
-        else:
-            padded_args_ids = args_ids[:self.max_len]
-        
-        # 转换为 PyTorch 张量
-        command_tensor = torch.LongTensor(padded_command_ids)
-        args_tensor = torch.LongTensor(padded_args_ids)
-        
-        # 对于自回归模型，通常输入是 target[:-1], 目标是 target[1:]
-        # 在这里，我们返回完整的序列，具体的切分在训练循环中处理
-        return command_tensor, args_tensor
+        sample_info = self.samples[idx]
+        sample_id = sample_info['id']
+        npz_path = sample_info['npz_path']
 
-# --- 用于测试的示例代码 ---
+        # 1. 加载预处理后的 CAD 序列
+        cad_sequence_data = np.load(npz_path)
+        cad_sequence = cad_sequence_data['cad_sequence'] # 形状 (macro.CAD_MAX_TOTAL_LEN, 13) 
+        cad_sequence = torch.from_numpy(cad_sequence).long() # 转换为 LongTensor
+
+        # 分离命令和参数，如果模型需要
+        command_tokens = cad_sequence[:, 0]
+        arg_tokens = cad_sequence[:, 1:]
+
+        # 2. 加载文本描述
+        text_caption = self.text_captions.get(sample_id, "无描述") # 如果没有找到，提供一个默认值
+
+        # 3. 加载图像 (多视图处理)
+        # 默认返回一个堆叠的黑色图像tensor
+        image_tensors = torch.zeros(self.num_views_to_sample, 3, 224, 224) 
+
+        if self.raw_image_dir:
+            img_id_parts = sample_id.split('/') # 例如 ['0000', '00000068_00001']
+            img_subdir = img_id_parts[0]
+            img_base_name = img_id_parts[1] # 例如 '00000068_00001'
+
+            # 查找所有可能的视图文件
+            all_view_paths = []
+            # 假设视图后缀是 _XXX 格式，查找 pattern: raw_image_dir/subdir/basename_*.png/jpg
+            view_pattern = os.path.join(self.raw_image_dir, img_subdir, img_base_name + "_*")
+            
+            # 查找所有可能的图片文件（png, jpg, jpeg）
+            for ext in ['.png', '.jpg', '.jpeg']:
+                all_view_paths.extend(glob.glob(view_pattern + ext))
+            
+            # 如果没有找到带后缀的视图，尝试查找不带后缀的通用图片名
+            if not all_view_paths:
+                for ext in ['.png', '.jpg', '.jpeg']:
+                    potential_generic_path = os.path.join(self.raw_image_dir, img_subdir, img_base_name + ext)
+                    if os.path.exists(potential_generic_path):
+                        all_view_paths.append(potential_generic_path)
+                        break # 找到通用图片就够了
+
+            # 从所有找到的视图中随机采样 num_views_to_sample 张
+            if all_view_paths:
+                selected_view_paths = random.sample(all_view_paths, min(len(all_view_paths), self.num_views_to_sample))
+                
+                loaded_images = []
+                for img_path in selected_view_paths:
+                    try:
+                        image = Image.open(img_path).convert('RGB')
+                        loaded_images.append(self.image_transform(image))
+                    except Exception as e:
+                        print(f"警告: 无法加载或处理图片 {img_path}: {e}")
+                
+                if loaded_images:
+                    image_tensors = torch.stack(loaded_images) # 堆叠成 (k, C, H, W)
+                else:
+                    print(f"警告: 尽管找到图片路径，但未能加载 {sample_id} 的任何图片。")
+            else:
+                pass # print(f"警告: 未找到 {sample_id} 对应的任何视图图片。") # 频繁打印可能很吵
+
+        return {
+            'id': sample_id,
+            'cad_sequence': cad_sequence, # 整个 (60, 13) 矩阵
+            'command_tokens': command_tokens, # 1D命令序列
+            'arg_tokens': arg_tokens,       # 2D参数序列
+            'text_caption': text_caption,
+            'image': image_tensors # 现在是 (k, 3, 224, 224)
+        }
+
+# 简单的测试 (在 __main__ 块中运行)
 if __name__ == '__main__':
-    # 模拟一个与简化后tokenizer相匹配的Config类
-    class MockConfig:
-        def __init__(self):
-            # 关键属性，必须与tokenizer的__init__匹配
-            self.pad_val = -1
-            self.cad_n_args = 12
-            self.cad_n_args_sketch = 5
-            self.angle_bins = 9
-            self.pos_grid_size = 36
-            # 以下属性在新的tokenizer中不直接使用，但为保持兼容性而提供
-            self.n_bins = 256
-            self.sketch_bins = 128
-            self.min_val = -1.0
-            self.max_val = 1.0
+    # 假设你已经运行了 preprocess_data.py，并且输出在 data/processed
+    mock_processed_dir = 'data/processed'
+    mock_raw_text_file = 'data/raw/text/0000.json' # 假设文本在一个文件中
+    mock_raw_image_dir = 'data/raw/step_img' # 假设图片在一个目录中
 
-        # 以下属性的getter也不再是测试的关键
-        @property
-        def n_angle_tokens(self): return self.angle_bins ** 3
-        @property
-        def n_pos_tokens(self): return self.pos_grid_size ** 3
-        @property
-        def n_sketch_tokens(self): return self.sketch_bins * 2
-
-    mock_cfg = MockConfig()
+    # 创建一个 dummy 图片目录，以避免FileNotFoundError
+    # 确保每个 ID 有多个视图，例如 '_000', '_001'
+    os.makedirs(os.path.join(mock_raw_image_dir, '0000'), exist_ok=True)
     
-    # 为了测试，先手动创建一个假的h5文件
-    test_dir = 'data/raw/cad_vec_test'
-    if not os.path.exists(f'{test_dir}/0000'):
-        os.makedirs(f'{test_dir}/0000')
-    
-    # 使用与tokenizer词汇表一致的正确命令ID
-    # CAD_COMMANDS = ['Line', 'Arc', 'Circle', 'EOS', 'SOL', 'Ext']
-    # ID ->           0,     1,      2,       3,     4,     5
-    mock_h5_data = np.array([
-        [  4, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1], # SOL
-        [  2, 176, 128, -1, -1, 48, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1], # Circle
-        [  5, -1, -1, -1, -1, -1, 6, 4, 2, 18, 18, 18, 30, -1, -1, -1, -1],   # Extrude
-        [  3, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1]  # EOS
-    ], dtype=np.int64)
+    dummy_img_base = os.path.join(mock_raw_image_dir, '0000', '00000068_00001')
+    if not os.path.exists(dummy_img_base + '_000.png'):
+        Image.new('RGB', (100, 100), color = 'red').save(dummy_img_base + '_000.png')
+    if not os.path.exists(dummy_img_base + '_001.png'):
+        Image.new('RGB', (100, 100), color = 'blue').save(dummy_img_base + '_001.png')
+    if not os.path.exists(dummy_img_base + '.png'): # 通用名也创建一个
+        Image.new('RGB', (100, 100), color = 'green').save(dummy_img_base + '.png')
 
-    test_h5_path = f'{test_dir}/0000/test.h5'
-    with h5py.File(test_h5_path, 'w') as f:
-        f.create_dataset('vec', data=mock_h5_data)
 
-    print(f"创建了一个假的 HDF5 文件用于测试: {test_h5_path}")
+    print("正在初始化 CADDataset (采样1个视图)...")
+    dataset_single_view = CADDataset(
+        processed_data_dir=mock_processed_dir,
+        raw_text_dir=mock_raw_text_file,
+        raw_image_dir=mock_raw_image_dir,
+        sample_limit=2, # 限制加载2个样本进行测试
+        num_views_to_sample=1
+    )
+    print(f"数据集大小 (单视图): {len(dataset_single_view)} 个样本")
 
-    # 创建 Dataset 实例
-    dataset = CADDataset(data_dir=test_dir, config=mock_cfg, max_len=10)
-    
-    print(f"\n找到 {len(dataset)} 个数据文件。\n")
-    
-    # 获取第一个样本
-    if len(dataset) > 0:
-        commands, args = dataset[0]
-        
-        print("获取的第一个样本 (已填充到长度10):")
-        print("命令张量 (shape):", commands.shape)
-        print("命令张量 (内容):", commands)
-        
-        print("\n参数张量 (shape):", args.shape)
-        print("参数张量 (内容):")
-        print(args)
-
-        # 验证Extrude的组合Token是否正确
-        # 原始数据中Extrude在第3行(索引2)，命令ID为5
-        # 编码后它在最终张量的第3行(索引2)
-        ext_args_tensor = args[2]
-        expected_angle_token = 2 * (9**2) + 4 * 9 + 6 # g*81 + p*9 + t = 204
-        expected_pos_token = 18 * (36**2) + 18 * 36 + 18 # z*1296 + y*36 + x = 23994
-        
-        print(f"\n验证 'Ext' 命令的参数 (第3行):")
-        print(f"  - 角度Token: {ext_args_tensor[5]} (预期: {expected_angle_token})")
-        print(f"  - 位置Token: {ext_args_tensor[6]} (预期: {expected_pos_token})")
-        assert ext_args_tensor[5] == expected_angle_token
-        assert ext_args_tensor[6] == expected_pos_token
-        print("  验证通过！")
-
+    if len(dataset_single_view) > 0:
+        sample = dataset_single_view[0]
+        print(f"\n第一个样本的 ID: {sample['id']}")
+        print(f"CAD 序列形状: {sample['cad_sequence'].shape}")
+        print(f"命令 Token 形状: {sample['command_tokens'].shape}")
+        print(f"参数 Token 形状: {sample['arg_tokens'].shape}")
+        print(f"文本描述: {sample['text_caption']}")
+        print(f"图像 Tensor 形状 (单视图): {sample['image'].shape}") # 期望 (1, 3, 224, 224)
+        print(f"CAD 序列前2行:\n{sample['cad_sequence'][:2]}")
     else:
-        print("没有找到数据，无法测试。")
+        print("数据集中没有可用的样本。" )
+    
+    print("\n----------------------------------------------------")
+    print("正在初始化 CADDataset (采样2个视图)...")
+    dataset_multi_view = CADDataset(
+        processed_data_dir=mock_processed_dir,
+        raw_text_dir=mock_raw_text_file,
+        raw_image_dir=mock_raw_image_dir,
+        sample_limit=2, # 限制加载2个样本进行测试
+        num_views_to_sample=2 # 采样2个视图
+    )
+    print(f"数据集大小 (多视图): {len(dataset_multi_view)} 个样本")
+    if len(dataset_multi_view) > 0:
+        sample_multi = dataset_multi_view[0]
+        print(f"图像 Tensor 形状 (多视图): {sample_multi['image'].shape}") # 期望 (2, 3, 224, 224))

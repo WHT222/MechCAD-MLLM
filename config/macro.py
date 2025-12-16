@@ -1,12 +1,13 @@
 import numpy as np
 
-CAD_COMMANDS = ['Line', 'Arc', 'Circle', 'EOS', 'SOL', 'Ext']
+CAD_COMMANDS = ['Line', 'Arc', 'Circle', 'EOS', 'SOL', 'Ext','SOS']
 CAD_LINE_IDX = CAD_COMMANDS.index('Line')
 CAD_ARC_IDX = CAD_COMMANDS.index('Arc')
 CAD_CIRCLE_IDX = CAD_COMMANDS.index('Circle')
 CAD_EOS_IDX = CAD_COMMANDS.index('EOS')
 CAD_SOL_IDX = CAD_COMMANDS.index('SOL')
 CAD_EXT_IDX = CAD_COMMANDS.index('Ext')
+CAD_SOS_IDX = CAD_COMMANDS.index('SOS')
 
 CAD_EXTRUDE_OPERATIONS = ["NewBodyFeatureOperation", "JoinFeatureOperation",
                       "CutFeatureOperation", "IntersectFeatureOperation"]#挤出操作类型
