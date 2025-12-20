@@ -56,6 +56,7 @@ def process_single_cad_file(json_path, tokenizer):
                 for loop in profile.get('loops', []):
                     # --- 添加 SOL (Start of Loop) 命令 ---
                     sol_cmd_idx = macro.CAD_COMMANDS.index('SOL')
+                    # SOL 命令没有参数，其参数向量是全空的
                     sol_arg_vec = [tokenizer.empty_token_id] * macro.CAD_N_ARGS
                     sequence_vectors.append([sol_cmd_idx] + sol_arg_vec)
                     
@@ -63,31 +64,16 @@ def process_single_cad_file(json_path, tokenizer):
                     for curve in loop.get('profile_curves', []):
                         curve_type = curve.get('type')
                         cmd_str = None
-                        raw_params = {}
+                        
+                        # 直接将 curve 字典作为 raw_params 传递
+                        raw_params = curve
 
                         if curve_type == 'Line3D':
                             cmd_str = 'Line'
-                            # 根据 macro.py, Line 需要 end_x, end_y
-                            # Omni-CAD 有 start_point 和 end_point，这里简化为只用 end_point
-                            # 在实际模型中，通常是基于当前画笔位置的相对移动
-                            raw_params = {'end_point': curve.get('end_point', {})}
-
                         elif curve_type == 'Circle3D':
                             cmd_str = 'Circle'
-                            # macro.py 需要 center_x, center_y, radius
-                            raw_params = {
-                                'center_point': curve.get('center_point', {}),
-                                'radius': curve.get('radius')
-                            }
-                        
                         elif curve_type == 'Arc3D':
                             cmd_str = 'Arc'
-                            # macro.py 需要 center_x, center_y, start_angle, end_angle
-                            raw_params = {
-                                'center_point': curve.get('center_point', {}),
-                                'start_angle': curve.get('start_angle'),
-                                'end_angle': curve.get('end_angle')
-                            }
 
                         if cmd_str:
                             cmd_idx = macro.CAD_COMMANDS.index(cmd_str)
@@ -104,6 +90,15 @@ def process_single_cad_file(json_path, tokenizer):
             cmd_str = 'Ext'
             cmd_idx = macro.CAD_COMMANDS.index(cmd_str)
             # ExtrudeFeature 的所有信息都在 entity 字典中，直接作为 raw_params 传入
+            # 我们需要将它关联的 Sketch 的 transform 信息也传入，因为 Extrude 命令需要它
+            profiles = entity.get('profiles', [])
+            if profiles:
+                # (注意: 这是一个简化，假设 Extrude 总是使用其关联的第一个 profile 的 sketch 的 transform)
+                associated_sketch_id = profiles[0].get('sketch')
+                if associated_sketch_id:
+                    sketch_entity = data.get('entities', {}).get(associated_sketch_id, {})
+                    entity['transform'] = sketch_entity.get('transform', {})
+
             arg_vec = tokenizer.create_argument_vector(cmd_str, entity, bbox)
             sequence_vectors.append([cmd_idx] + arg_vec)
 
@@ -112,20 +107,24 @@ def process_single_cad_file(json_path, tokenizer):
 
     # 将列表转换为 numpy 数组
     final_sequence = np.array(sequence_vectors, dtype=np.int32)
-
-    # 填充到最大长度
+    
+    # 截断或填充到最大长度
     num_steps = final_sequence.shape[0]
-    if num_steps < macro.CAD_MAX_TOTAL_LEN:
+    if num_steps > macro.CAD_MAX_TOTAL_LEN:
+        # 截断
+        final_sequence = final_sequence[:macro.CAD_MAX_TOTAL_LEN, :]
+    else:
+        # 填充
         padding_len = macro.CAD_MAX_TOTAL_LEN - num_steps
         # 使用 PAD_VAL (-1) 进行填充
         # 注意：这里的 PAD_VAL 是-1，不是 tokenizer 中的 pad_token_id
         # 模型在处理时需要能识别这种填充
         padding = np.full((padding_len, 1 + macro.CAD_N_ARGS), macro.PAD_VAL, dtype=np.int32)
-        # 将命令列的填充值设为 EOS_IDX，参数列设为 PAD_VAL
+        # 将命令列的填充值设为 EOS_IDX，参数列设为 PAD_VAL (-1)
         padding[:, 0] = macro.CAD_EOS_IDX 
         final_sequence = np.vstack([final_sequence, padding])
     
-    return final_sequence[:macro.CAD_MAX_TOTAL_LEN, :]
+    return final_sequence
 
 
 def main(args):
@@ -134,7 +133,7 @@ def main(args):
     try:
         tokenizer = CADTokenizer(vocab_path=args.vocab_path)
     except FileNotFoundError:
-        print(f"错误: 词汇表文件未找到于 '{args.vocab_path}'。请先创建该文件。")
+        print(f"错误: 词汇表文件未找到于 '{args.vocab_path}'。请确保文件存在。")
         sys.exit(1)
     except ImportError as e:
         if 'scipy' in str(e):
@@ -176,9 +175,9 @@ def main(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="将 Omni-CAD JSON 数据预处理为 (N, 13) 的指令矩阵。")
-    parser.add_argument('--data_dir', type=str, default='data/raw_old/json', help="Omni-CAD 数据集的 JSON 文件根目录")
+    parser.add_argument('--data_dir', type=str, default='data/raw/json', help="Omni-CAD 数据集的 JSON 文件根目录")
     parser.add_argument('--output_dir', type=str, default='data/processed', help="保存处理后的 .npz 文件的目录。")
-    parser.add_argument('--vocab_path', type=str, default='config/vocab.json', help="参数值Token词汇表的路径。")
+    parser.add_argument('--vocab_path', type=str, default='config/arg_vocab.json', help="参数值Token词汇表的路径。")
     
     args = parser.parse_args()
     main(args)
