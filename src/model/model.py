@@ -1,3 +1,7 @@
+import torch
+import torch.nn as nn
+from transformers import AutoProcessor, LlavaForConditionalGeneration # Assuming transformers will be installed
+
 from .layers.transformer import *
 from .layers.improved_transformer import *
 from .layers.positional_encoding import *
@@ -18,7 +22,9 @@ class ConstEmbedding(nn.Module):
         self.seq_len = cfg.cad_max_total_len
 
     def forward(self, z):
+        # z: [Seq_Len_LLM, Batch, Dim]
         N = z.size(1)
+        # Create a zero tensor of shape [Seq_Len_CAD, Batch, Dim] and add PE
         src = self.PE(z.new_zeros(self.seq_len, N, self.d_model))
         return src
 
@@ -67,15 +73,21 @@ class CommandDecoder(nn.Module):
 
         self.embedding = ConstEmbedding(cfg)
 
-        decoder_layer = TransformerDecoderLayerGlobalImproved(cfg.d_model, cfg.dim_z, cfg.n_heads, cfg.dim_feedforward, cfg.dropout)
+        # Use TransformerDecoderLayerImproved which supports Multihead Attention for memory
+        # This allows attending to the full LLM sequence
+        decoder_layer = TransformerDecoderLayerImproved(cfg.d_model, cfg.n_heads, cfg.dim_feedforward, cfg.dropout)
         decoder_norm = LayerNorm(cfg.d_model)
         self.decoder = TransformerDecoder(decoder_layer, cfg.n_layers_decode, decoder_norm)
 
         self.fcn = CommandFCN(cfg.d_model, cfg.cad_n_commands)
 
-    def forward(self, z):
-        src = self.embedding(z)
-        out = self.decoder(src, z, tgt_mask=None, tgt_key_padding_mask=None)
+    def forward(self, z, memory_key_padding_mask=None):
+        # z (memory) is [Seq_Len_LLM, Batch, d_model]
+        src = self.embedding(z) # [Seq_Len_CAD, Batch, d_model]
+        
+        # Decoder attends to z (LLM features)
+        out = self.decoder(src, z, tgt_mask=None, memory_mask=None, 
+                           tgt_key_padding_mask=None, memory_key_padding_mask=memory_key_padding_mask)
 
         command_logits = self.fcn(out)
 
@@ -88,11 +100,11 @@ class ArgsDecoder(nn.Module):
 
         self.embedding = ConstEmbedding(cfg)
 
-        decoder_layer = TransformerDecoderLayerGlobalImproved(cfg.d_model, cfg.dim_z, cfg.n_heads, cfg.dim_feedforward, cfg.dropout)
+        decoder_layer = TransformerDecoderLayerImproved(cfg.d_model, cfg.n_heads, cfg.dim_feedforward, cfg.dropout)
         decoder_norm = LayerNorm(cfg.d_model)
         self.decoder = TransformerDecoder(decoder_layer, cfg.n_layers_decode, decoder_norm)
 
-        # 基础全连接网络，输出尺寸为 args_dim + 1
+        # 基础全连接网络，输出尺寸为 args_dim + 1 
         args_dim_features = cfg.args_dim + 1 
         self.fcn = ArgsFCN(cfg.d_model, cfg.cad_n_args, args_dim_features)
 
@@ -111,12 +123,18 @@ class ArgsDecoder(nn.Module):
         self.pos_head = nn.Linear(args_dim_features, self.n_pos_tokens)
 
 
-    def forward(self, z, guidance):
-        src = self.embedding(z)
-        out = self.decoder(src, z, tgt_mask=None, tgt_key_padding_mask=None)
-
-        # guidance
-        out = out + guidance
+    def forward(self, z, guidance, memory_key_padding_mask=None):
+        # z (memory) is [Seq_Len_LLM, Batch, d_model]
+        # guidance is [Seq_Len_CAD, Batch, d_model] from CommandDecoder
+        
+        src = self.embedding(z) # [Seq_Len_CAD, Batch, d_model]
+        
+        # Inject guidance into the query
+        # This helps the ArgsDecoder know which command it is generating args for
+        src = src + guidance
+        
+        out = self.decoder(src, z, tgt_mask=None, memory_mask=None, 
+                           tgt_key_padding_mask=None, memory_key_padding_mask=memory_key_padding_mask)
 
         # args_features: [S, N, cad_n_args, args_dim_features]
         args_features = self.fcn(out)
@@ -151,34 +169,91 @@ class LLM2CADDecoder(nn.Module):
         self.command_decoder = CommandDecoder(cfg)
         self.args_decoder = ArgsDecoder(cfg)
 
-    def forward(self, llm_features):
+    def forward(self, llm_features, memory_key_padding_mask=None):
         """
         llm_features: [Batch_Size, LLM_Seq_Len, LLM_Hidden_Dim] 
                       这是 MLLM (如 LLaVA) 输出的语义向量
+        memory_key_padding_mask: [Batch_Size, LLM_Seq_Len] (BoolTensor)
+                                True indicates the position should be ignored.
         """
         # 步骤 A: 维度适配
         # z 的形状变为 [Batch_Size, LLM_Seq_Len, 256]
         z = self.adapter(llm_features)
         
-        # 步骤 B: 聚合特征 (Pooling)
-        # Drawing2CAD 的解码器期望 z 是全局特征。
-        # 这里我们简单地取平均，或者取第一个 token (CLS) 的特征。后续改进为注意力池化等更复杂的方式也可以。
-        # z 形状变为 [1, Batch_Size, 256] 以适配 Transformer Decoder 的输入要求 (Seq_Len, Batch, Dim)
-        z = torch.mean(z, dim=1, keepdim=True).permute(1, 0, 2) #(Batch, 1, Dim) -> (1, Batch, Dim)
+        # 步骤 B: 维度重排以适配 Transformer [Seq_Len, Batch_Size, Dim]
+        z = z.permute(1, 0, 2)
 
         # 步骤 C: 双解码生成
         # 1. 先预测命令，并输出 guidance (指导信号)
         # command_logits: [Seq_Len, Batch, n_commands]
         # guidance: [Seq_Len, Batch, d_model] -> 包含了解码器对“当前是什么命令”的理解
-        command_logits, guidance = self.command_decoder(z)
+        # 这里 z 保持序列结构，解码器通过 Attention 机制关注 LLM 的特征
+        command_logits, guidance = self.command_decoder(z, memory_key_padding_mask=memory_key_padding_mask)
 
         # 2. 再预测参数，将 guidance 加进去
-        args_features_for_continuous, angle_token_logits, pos_token_logits = self.args_decoder(z, guidance)
+        args_features_for_continuous, angle_token_logits, pos_token_logits = \
+            self.args_decoder(z, guidance, memory_key_padding_mask=memory_key_padding_mask)
 
         # 调整输出维度为 [Batch, Seq_Len, ...] 以便计算 Loss
         command_logits = command_logits.permute(1, 0, 2)# [N, S, n_commands]
         args_features_for_continuous = args_features_for_continuous.permute(1, 0, 2, 3)# [N, S, n_args, args_dim]
         angle_token_logits = angle_token_logits.permute(1, 0, 2) # [N, S, n_angle_tokens]
         pos_token_logits = pos_token_logits.permute(1, 0, 2) # [N, S, n_pos_tokens]
+
+        return command_logits, args_features_for_continuous, angle_token_logits, pos_token_logits
+
+
+class LLaVAEncoder(nn.Module):
+    def __init__(self, cfg, model_name="llava-hf/llava-1.5-7b-hf"):
+        super().__init__()
+        # Load LLaVA model and processor
+        self.processor = AutoProcessor.from_pretrained(model_name)
+        self.llava_model = LlavaForConditionalGeneration.from_pretrained(model_name)
+        self.llava_model.eval() # Set to eval mode, typically we freeze the MLLM encoder
+
+        # Ensure that the hidden_size of LLaVA matches what LLM2CADDecoder expects
+        # LLaVA-1.5-7B has a hidden size of 4096 for its language model outputs
+        assert self.llava_model.config.hidden_size == cfg.llm_hidden_dim, \
+            f"LLaVA model hidden size ({self.llava_model.config.hidden_size}) does not match cfg.llm_hidden_dim ({cfg.llm_hidden_dim})"
+
+    def forward(self, images, texts):
+        # Prepare inputs for LLaVA
+        # images: List of PIL Image objects
+        # texts: List of text strings (prompts)
+        inputs = self.processor(text=texts, images=images, return_tensors="pt", padding=True)
+        
+        # Move inputs to device (e.g., GPU)
+        for k, v in inputs.items():
+            if isinstance(v, torch.Tensor):
+                inputs[k] = v.to(self.llava_model.device)
+
+        with torch.no_grad(): # Don't compute gradients for the frozen LLaVA model
+            # Get hidden states from LLaVA's language model part
+            # output_hidden_states=True gives access to the encoder/decoder outputs
+            outputs = self.llava_model(**inputs, output_hidden_states=True)
+            
+            # Usually, the last_hidden_state of the language model is used
+            # It's typically [Batch, Sequence_Length, Hidden_Size]
+            llm_features = outputs.language_model_outputs.last_hidden_state
+            
+            # The attention mask from LLaVA can be directly used for padding in our decoder
+            memory_key_padding_mask = inputs.attention_mask.bool() # True means pad, False means not pad
+
+        return llm_features, memory_key_padding_mask
+
+
+class MechCAD(nn.Module):
+    def __init__(self, cfg, llava_model_name="llava-hf/llava-1.5-7b-hf"):
+        super().__init__()
+        self.llava_encoder = LLaVAEncoder(cfg, model_name=llava_model_name)
+        self.llm2cad_decoder = LLM2CADDecoder(cfg, llm_hidden_dim=cfg.llm_hidden_dim)
+
+    def forward(self, images, texts):
+        # Encode images and texts using LLaVA
+        llm_features, memory_key_padding_mask = self.llava_encoder(images, texts)
+
+        # Decode CAD commands and arguments
+        command_logits, args_features_for_continuous, angle_token_logits, pos_token_logits = \
+            self.llm2cad_decoder(llm_features, memory_key_padding_mask)
 
         return command_logits, args_features_for_continuous, angle_token_logits, pos_token_logits

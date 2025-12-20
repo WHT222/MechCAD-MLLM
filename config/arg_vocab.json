@@ -1,0 +1,65 @@
+{
+  "_comment": "MechCAD-MLLM Argument-Decoder-Specific Vocabulary v2.0",
+  
+  "description": "Vocabulary for Argument Decoder (Geometry & Spatial Attributes). Command vocabulary is defined in config/macro.py",
+
+  "special_tokens": {
+    "<EMPTY>": 0
+  },
+  "value_ranges": {
+    "V_tokens": {
+      "description": "Basic Quantized Values (Coordinates, Radius, Scale)",
+      "num_bins": 256,
+      "start_id": 1,
+      "end_id": 256
+    },
+    "A_tokens": {
+      "description": "Spatial Angle Tokens (9^3 Euler Angles)",
+      "num_bins": 729,
+      "start_id": 257,
+      "end_id": 985
+    },
+    "P_tokens": {
+      "description": "Spatial Position Tokens (36^3 Voxel Grid)",
+      "num_bins": 46656,
+      "start_id": 986,
+      "end_id": 47641
+    },
+    "BOOL_tokens": {
+      "description": "Extrude Operation Type (NewBody, Join, Cut, Intersect)",
+      "num_bins": 4,
+      "start_id": 47642,
+      "end_id": 47645,
+      "mapping": {
+        "0": "NewBodyFeatureOperation",
+        "1": "JoinFeatureOperation",
+        "2": "CutFeatureOperation",
+        "3": "IntersectFeatureOperation"
+      }
+    },
+    "EXTENT_tokens": {
+      "description": "Extrude Extent Type (OneSide, Symmetric, TwoSides)",
+      "num_bins": 3,
+      "start_id": 47646,
+      "end_id": 47648,
+      "mapping": {
+        "0": "OneSideFeatureExtentType",
+        "1": "SymmetricFeatureExtentType",
+        "2": "TwoSidesFeatureExtentType"
+      }
+    },
+    "SX_tokens": {
+      "description": "2D Sketch X-Coordinate Tokens (128 Bins)",
+      "num_bins": 128,
+      "start_id": 47649,
+      "end_id": 47776
+    },
+    "SY_tokens": {
+      "description": "2D Sketch Y-Coordinate Tokens (128 Bins)",
+      "num_bins": 128,
+      "start_id": 47777,
+      "end_id": 47904
+    }
+  },
+  "vocab_size": 47905
+}

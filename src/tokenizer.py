@@ -27,14 +27,25 @@ class CADTokenizer:
         # 1. 加载特殊 token (<EMPTY>)
         self.token_to_id.update(vocab_data['special_tokens'])
         
-        # 2. 动态生成并加载量化值 token (P, A, V, BOOL, EXTENT)
+        # 2. 动态生成并加载量化值 token (P, A, V, BOOL, EXTENT, SX, SY)
         self.value_ranges = vocab_data['value_ranges']
         for key, value in self.value_ranges.items():
-            prefix = key.split('_')[0]
-            start_id = value['start_id']
-            num_bins = value['num_bins']
-            for i in range(num_bins):
-                self.token_to_id[f"<{prefix}_{i}>"] = start_id + i
+            # Add a check for "SX_tokens" and "SY_tokens" specifically to build the token strings
+            if key == "SX_tokens":
+                # For SX_tokens, generate tokens like <SX_0>, <SX_1>, ...
+                for i in range(value['num_bins']):
+                    self.token_to_id[f"<SX_{i}>"] = value['start_id'] + i
+            elif key == "SY_tokens":
+                # For SY_tokens, generate tokens like <SY_0>, <SY_1>, ...
+                for i in range(value['num_bins']):
+                    self.token_to_id[f"<SY_{i}>"] = value['start_id'] + i
+            else:
+                # For other tokens (V, A, P, BOOL, EXTENT), use the general prefix_N format
+                prefix = key.split('_')[0]
+                start_id = value['start_id']
+                num_bins = value['num_bins']
+                for i in range(num_bins):
+                    self.token_to_id[f"<{prefix}_{i}>"] = start_id + i
 
         self.id_to_token = {v: k for k, v in self.token_to_id.items()}
 
@@ -67,13 +78,28 @@ class CADTokenizer:
         return max_dim if max_dim > 1e-6 else 1.0
 
     def tokenize_scalar_param(self, raw_value, bbox):
-        """将标量参数（如x, y, radius, distance）量化为一个 V_token ID"""
+        """将通用标量参数（如radius, distance）量化为一个 V_token ID (256 bins)"""
         max_dim = self._get_bbox_max_dim(bbox)
         # 假设参数值范围大致在 [-max_dim/2, max_dim/2]
         normalized_val = self._normalize_value(raw_value, -max_dim / 2, max_dim / 2)
         
         v_bin = self._quantize_value(normalized_val, self.value_ranges['V_tokens']['num_bins'])
         return self.value_ranges['V_tokens']['start_id'] + v_bin
+
+    def tokenize_sketch_2d_param(self, raw_value, bbox, axis_type):
+        """将2D草图坐标（X或Y）量化为一个 SX_token 或 SY_token ID (128 bins)"""
+        if axis_type not in ['X', 'Y']:
+            raise ValueError("axis_type must be 'X' or 'Y'")
+
+        token_key = f"S{axis_type}_tokens"
+        num_bins = self.value_ranges[token_key]['num_bins'] # Should be 128
+        
+        max_dim = self._get_bbox_max_dim(bbox)
+        # For 2D sketch coordinates, assuming they are within [-max_dim/2, max_dim/2] range
+        normalized_val = self._normalize_value(raw_value, -max_dim / 2, max_dim / 2)
+
+        s_bin = self._quantize_value(normalized_val, num_bins)
+        return self.value_ranges[token_key]['start_id'] + s_bin
 
     def tokenize_3d_point_param(self, point_dict, bbox):
         """将 3D 点 (例如草图平面原点) 量化为一个 P_token ID"""
@@ -151,22 +177,22 @@ class CADTokenizer:
         except ValueError:
             if command_type_str in ['SOL', 'EOS']:
                 return arg_vector
-            print(f"警告: 未知的命令类型 '{command_type_str}'，返回全空参数向量。")
+            print(f"警告: 未知的命令类型 '{command_type_str}'，返回全空参数向量.\n")
             return arg_vector 
 
         if command_type_str == 'Line':
-            if arg_mask[0]: arg_vector[0] = self.tokenize_scalar_param(raw_params.get('end_point', {}).get('x', 0.0), bbox)
-            if arg_mask[1]: arg_vector[1] = self.tokenize_scalar_param(raw_params.get('end_point', {}).get('y', 0.0), bbox)
+            if arg_mask[0]: arg_vector[0] = self.tokenize_sketch_2d_param(raw_params.get('end_point', {}).get('x', 0.0), bbox, 'X')
+            if arg_mask[1]: arg_vector[1] = self.tokenize_sketch_2d_param(raw_params.get('end_point', {}).get('y', 0.0), bbox, 'Y')
         
         elif command_type_str == 'Arc':
-            if arg_mask[0]: arg_vector[0] = self.tokenize_scalar_param(raw_params.get('center_point', {}).get('x', 0.0), bbox)
-            if arg_mask[1]: arg_vector[1] = self.tokenize_scalar_param(raw_params.get('center_point', {}).get('y', 0.0), bbox)
+            if arg_mask[0]: arg_vector[0] = self.tokenize_sketch_2d_param(raw_params.get('center_point', {}).get('x', 0.0), bbox, 'X')
+            if arg_mask[1]: arg_vector[1] = self.tokenize_sketch_2d_param(raw_params.get('center_point', {}).get('y', 0.0), bbox, 'Y')
             if arg_mask[2]: arg_vector[2] = self.tokenize_scalar_param(raw_params.get('start_angle', 0.0), bbox)
             if arg_mask[3]: arg_vector[3] = self.tokenize_scalar_param(raw_params.get('end_angle', 0.0), bbox)
 
         elif command_type_str == 'Circle':
-            if arg_mask[0]: arg_vector[0] = self.tokenize_scalar_param(raw_params.get('center_point', {}).get('x', 0.0), bbox)
-            if arg_mask[1]: arg_vector[1] = self.tokenize_scalar_param(raw_params.get('center_point', {}).get('y', 0.0), bbox)
+            if arg_mask[0]: arg_vector[0] = self.tokenize_sketch_2d_param(raw_params.get('center_point', {}).get('x', 0.0), bbox, 'X')
+            if arg_mask[1]: arg_vector[1] = self.tokenize_sketch_2d_param(raw_params.get('center_point', {}).get('y', 0.0), bbox, 'Y')
             if arg_mask[4]: arg_vector[4] = self.tokenize_scalar_param(raw_params.get('radius', 0.0), bbox)
         
         elif command_type_str == 'Ext':
@@ -242,3 +268,12 @@ if __name__ == '__main__':
     ext_arg_vec = tokenizer.create_argument_vector('Ext', ext_raw_params, mock_bbox)
     print(f"\n解码 Extrude 参数向量 (槽位 5-11):")
     print(tokenizer.decode_sequence(ext_arg_vec[5:]))
+    
+    # NEW: Test sketch 2D tokens
+    print(f"\n测试 Line 命令的 2D 草图坐标 Token (X=5.0, Y=3.0):")
+    line_raw_params = {
+        'end_point': {'x': 5.0, 'y': 3.0}
+    }
+    line_arg_vec = tokenizer.create_argument_vector('Line', line_raw_params, mock_bbox)
+    print(f"X Token ID: {line_arg_vec[0]} -> 解码: {tokenizer.decode_token(line_arg_vec[0])}")
+    print(f"Y Token ID: {line_arg_vec[1]} -> 解码: {tokenizer.decode_token(line_arg_vec[1])}")
